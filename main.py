@@ -2,11 +2,18 @@ import discord
 import os
 import asyncio
 import aiohttp
-import yt_dlp 
+import yt_dlp
 import re
 import json
 from discord.ext import commands
 from datetime import datetime, timedelta
+import nacl  # Required for voice encryption
+import logging
+
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('discord')
+logger.setLevel(logging.INFO)
 
 # ==================== CONFIGURATION ====================
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
@@ -20,8 +27,8 @@ SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
 
 # ==================== YT-DLP OPTIONS ====================
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -loglevel quiet',
+    'options': '-vn -loglevel quiet'
 }
 
 YDL_OPTIONS = {
@@ -109,7 +116,6 @@ async def get_track_info(url, requester):
             if not info:
                 return None
             
-            # Handle playlists
             if 'entries' in info:
                 tracks = []
                 for entry in info['entries']:
@@ -126,7 +132,6 @@ async def get_track_info(url, requester):
                         tracks.append(track)
                 return tracks
             
-            # Single video
             track = {
                 'title': info.get('title', 'Unknown'),
                 'url': info.get('webpage_url', info.get('url')),
@@ -145,12 +150,10 @@ async def get_track_info(url, requester):
 async def search_youtube(query, requester):
     """Search YouTube for tracks"""
     try:
-        # Check if it's a URL
         youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
         if re.match(youtube_regex, query):
             return await get_track_info(query, requester)
         
-        # Search query
         search_query = f"ytsearch5:{query}"
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(search_query, download=False)
@@ -193,9 +196,7 @@ async def search_spotify(query, requester):
             client_secret=SPOTIFY_CLIENT_SECRET
         ))
         
-        # Check if it's a Spotify URL
         if "open.spotify.com" in query:
-            # Playlist
             if "playlist" in query:
                 playlist_id = query.split("playlist/")[1].split("?")[0]
                 results = sp.playlist_tracks(playlist_id)
@@ -213,8 +214,6 @@ async def search_spotify(query, requester):
                             'source': 'spotify'
                         }
                         tracks.append(track_info)
-            
-            # Single track
             elif "track" in query:
                 track_id = query.split("track/")[1].split("?")[0]
                 result = sp.track(track_id)
@@ -229,8 +228,6 @@ async def search_spotify(query, requester):
                     'source': 'spotify'
                 }
                 tracks.append(track_info)
-            
-            # Album
             elif "album" in query:
                 album_id = query.split("album/")[1].split("?")[0]
                 results = sp.album_tracks(album_id)
@@ -245,9 +242,7 @@ async def search_spotify(query, requester):
                         'source': 'spotify'
                     }
                     tracks.append(track_info)
-        
         else:
-            # Search query
             results = sp.search(q=query, type='track', limit=5)
             for item in results['tracks']['items']:
                 track_info = {
@@ -292,7 +287,6 @@ async def play_next(ctx, guild_id):
         queue.is_playing = False
         return
     
-    # Check loop
     if queue.loop and queue.current:
         next_track = queue.current
     else:
@@ -315,7 +309,7 @@ async def play_next(ctx, guild_id):
             await play_next(ctx, guild_id)
             return
         
-        # Create audio source
+        # Create audio source with better error handling
         audio_source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
         
         def after_play(error):
@@ -349,7 +343,7 @@ async def play_next(ctx, guild_id):
         queue.is_playing = False
         await play_next(ctx, guild_id)
 
-# ==================== MUSIC COMMANDS ====================
+# ==================== FIXED PLAY COMMAND ====================
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
@@ -361,9 +355,15 @@ async def play(ctx, *, query):
     voice_channel = ctx.author.voice.channel
     guild_id = ctx.guild.id
     
-    # Connect to voice channel
+    # Connect to voice channel with better error handling
     if not ctx.voice_client:
-        await voice_channel.connect()
+        try:
+            # Force reconnect with UDP enabled
+            await voice_channel.connect(timeout=10.0, reconnect=True)
+            await asyncio.sleep(2)  # Give time for connection to stabilize
+        except Exception as e:
+            await ctx.send(f"❌ Failed to connect to voice channel: {str(e)}")
+            return
     
     # Initialize queue for this guild
     if guild_id not in music_queues:
@@ -402,6 +402,8 @@ async def play(ctx, *, query):
     # Start playing if not already playing
     if not queue.is_playing:
         await play_next(ctx, guild_id)
+
+# ==================== REST OF YOUR COMMANDS ====================
 
 @bot.command(name="skip")
 async def skip(ctx):
@@ -644,17 +646,14 @@ async def on_voice_state_update(member, before, after):
         return
     
     if after.channel and not before.channel:
-        # User joined a voice channel
         voice_activity[member.id] = {
             "channel_id": after.channel.id,
             "last_active": datetime.now()
         }
     elif not after.channel and before.channel:
-        # User left voice channel
         if member.id in voice_activity:
             del voice_activity[member.id]
     elif after.channel and before.channel and after.channel.id != before.channel.id:
-        # User moved channels
         if after.channel.id == AFK_CHANNEL_ID:
             await move_to_afk(member, after.channel)
             return
@@ -663,9 +662,7 @@ async def on_voice_state_update(member, before, after):
             "last_active": datetime.now()
         }
     
-    # Check AFK timeout periodically
     if after.channel and after.channel.id != AFK_CHANNEL_ID:
-        # Start AFK check task
         asyncio.create_task(check_afk(member))
 
 async def check_afk(member):
@@ -675,7 +672,6 @@ async def check_afk(member):
     
     await asyncio.sleep(AFK_TIMEOUT_MINUTES * 60)
     
-    # Check if member is still in voice and active
     if not member.voice or not member.voice.channel:
         return
     
@@ -696,7 +692,6 @@ async def check_afk(member):
 async def update_member_presence(member):
     """Update member presence to your API"""
     try:
-        # Status mapping
         status_map = {
             discord.Status.online: "online",
             discord.Status.idle: "idle",
@@ -705,7 +700,6 @@ async def update_member_presence(member):
         }
         status = status_map.get(member.status, "offline")
         
-        # Extract activities
         activities = []
         custom_status = None
         
@@ -748,7 +742,6 @@ async def update_member_presence(member):
                     "url": getattr(activity, "url", None)
                 })
         
-        # Prepare payload
         payload = {
             "discord_id": str(member.id),
             "username": member.name,
@@ -760,7 +753,6 @@ async def update_member_presence(member):
             "last_updated": datetime.now().isoformat()
         }
         
-        # Send to API
         if activities or custom_status or status != "offline":
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
@@ -778,7 +770,6 @@ async def on_ready():
     print(f"📊 Bot ID: {bot.user.id}")
     print(f"🎵 Music Bot Ready!")
     
-    # Sync members
     guild = bot.get_guild(GUILD_ID)
     if guild:
         print(f"📋 Connected to server: {guild.name}")
@@ -830,7 +821,6 @@ async def stats(ctx):
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
     
-    # Music stats
     total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
@@ -847,7 +837,6 @@ async def help_command(ctx):
         color=discord.Color.blue()
     )
     
-    # Music commands
     music_commands = {
         "!play / !p": "Play a song from YouTube or Spotify",
         "!skip": "Skip the current song",
@@ -869,7 +858,6 @@ async def help_command(ctx):
     
     embed.add_field(name="🎵 Music Commands", value=music_text, inline=False)
     
-    # Utility commands
     utility = {
         "!ping": "Check bot latency",
         "!stats": "Show bot statistics",
@@ -884,8 +872,6 @@ async def help_command(ctx):
     
     embed.set_footer(text="🎶 Enjoy the music!")
     await ctx.send(embed=embed)
-
-# ==================== ERROR HANDLING ====================
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -908,4 +894,4 @@ if __name__ == "__main__":
         print("⚠️ WARNING: GUILD_ID not set! Some features may not work.")
     
     print("🚀 Starting bot...")
-    bot.run(TOKEN)
+    bot.run(TOKEN, reconnect=True)
