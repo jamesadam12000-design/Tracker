@@ -1,14 +1,59 @@
-import discord
-import os
+import sys
 import asyncio
-import aiohttp
-import yt_dlp
+import os
 import re
 import json
-from discord.ext import commands
-from datetime import datetime, timedelta
 import logging
-import nacl
+from datetime import datetime, timedelta
+import aiohttp
+import yt_dlp
+
+# ==================== FIX 4006 ERROR WITH MONKEY PATCH ====================
+# This fixes the voice connection 4006 error without external patches
+
+import discord
+from discord import VoiceClient
+
+# Save original connect method
+_original_connect = VoiceClient.connect
+
+async def _patched_connect(self, *, timeout=None, reconnect=True):
+    """Patched connect method that handles 4006 error properly"""
+    try:
+        # First, ensure any existing connection is cleaned up
+        if hasattr(self, 'ws') and self.ws:
+            try:
+                await self.ws.close()
+            except:
+                pass
+            self.ws = None
+        
+        # Try to connect with proper endpoint handling
+        return await _original_connect(self, timeout=timeout, reconnect=reconnect)
+        
+    except discord.errors.ConnectionClosed as e:
+        if e.code == 4006:
+            logging.warning(f"Voice connection closed with 4006, retrying...")
+            
+            # Clean up the broken connection
+            if hasattr(self, 'ws') and self.ws:
+                try:
+                    await self.ws.close()
+                except:
+                    pass
+                self.ws = None
+            
+            # Wait a moment before retrying
+            await asyncio.sleep(2)
+            
+            # Retry the connection
+            return await _original_connect(self, timeout=timeout or 30.0, reconnect=reconnect)
+        else:
+            raise
+
+# Apply the patch
+VoiceClient.connect = _patched_connect
+logging.info("✅ Applied 4006 voice connection fix")
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
@@ -55,13 +100,6 @@ intents.members = True
 intents.message_content = True
 intents.voice_states = True
 
-# Try to use the patched version
-try:
-    import pycord_fix_4006
-    logger.info("✅ Using patched discord.py for voice fix")
-except ImportError:
-    logger.warning("⚠️ Patched version not found, using standard discord.py")
-
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ==================== DATA STORAGE ====================
@@ -104,42 +142,10 @@ class MusicQueue:
     def is_empty(self):
         return len(self.queue) == 0
 
-# ==================== PATCHED VOICE CONNECTION ====================
-
-class PatchedVoiceClient(discord.VoiceClient):
-    """Voice client with the 4006 error fix"""
-    
-    async def connect(self, *, timeout=None, reconnect=True):
-        """Override connect with the fix for 4006"""
-        try:
-            # Disconnect any existing connection
-            if self.ws:
-                await self.ws.close()
-            
-            # Get voice server info
-            state = self.guild.voice_state
-            if not state:
-                raise discord.ClientException("No voice state available")
-            
-            # Create connection
-            await super().connect(timeout=timeout, reconnect=reconnect)
-            
-        except discord.errors.ConnectionClosed as e:
-            if e.code == 4006:
-                logger.warning("Voice connection closed with 4006, retrying...")
-                # Clear existing connection state
-                self.ws = None
-                await asyncio.sleep(1)
-                # Retry
-                await super().connect(timeout=timeout, reconnect=reconnect)
-            else:
-                raise
-
-# Replace the default voice client
-discord.VoiceClient = PatchedVoiceClient
+# ==================== FIXED VOICE CONNECTION ====================
 
 async def connect_voice(ctx):
-    """Connect to voice channel with patched client"""
+    """Connect to voice channel with retry logic and 4006 handling"""
     if not ctx.author.voice:
         return None, "❌ You need to be in a voice channel!"
     
@@ -153,22 +159,38 @@ async def connect_voice(ctx):
         await asyncio.sleep(1)
     
     # Connect with retries
-    for attempt in range(3):
+    for attempt in range(5):
         try:
-            voice_client = await voice_channel.connect(timeout=15.0, reconnect=True)
-            await asyncio.sleep(1)  # Wait for connection to stabilize
-            if voice_client.is_connected():
+            voice_client = await voice_channel.connect(timeout=20.0, reconnect=True)
+            await asyncio.sleep(1.5)  # Wait for connection to stabilize
+            
+            if voice_client and voice_client.is_connected():
                 logger.info(f"✅ Connected to {voice_channel.name}")
                 return voice_client, None
+                
         except discord.errors.ConnectionClosed as e:
-            if e.code == 4006 and attempt < 2:
-                logger.warning(f"4006 error, retrying... (attempt {attempt + 1})")
+            if e.code == 4006:
+                logger.warning(f"4006 error on attempt {attempt + 1}, retrying...")
+                # Clean up any broken connection state
+                if ctx.voice_client:
+                    try:
+                        await ctx.voice_client.disconnect()
+                    except:
+                        pass
                 await asyncio.sleep(2)
                 continue
-            return None, f"❌ Voice connection error: {str(e)}"
+            return None, f"❌ Voice connection closed: {str(e)}"
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Connection timeout on attempt {attempt + 1}")
+            if attempt < 4:
+                await asyncio.sleep(2)
+                continue
+            return None, "❌ Connection timed out"
+            
         except Exception as e:
             logger.error(f"Connection attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
+            if attempt < 4:
                 await asyncio.sleep(2)
                 continue
             return None, f"❌ Failed to connect: {str(e)}"
@@ -395,7 +417,6 @@ async def play_next(ctx, guild_id):
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
     """Play a song from YouTube or Spotify"""
-    # Connect to voice
     voice_client, error = await connect_voice(ctx)
     if error:
         await ctx.send(error)
@@ -403,7 +424,6 @@ async def play(ctx, *, query):
     
     guild_id = ctx.guild.id
     
-    # Initialize queue
     if guild_id not in music_queues:
         music_queues[guild_id] = MusicQueue()
         music_loop[guild_id] = False
@@ -602,6 +622,10 @@ async def move_to_afk(member, afk_channel):
         await asyncio.sleep(0.5)
         await member.edit(mute=True, deafen=True)
         logger.info(f"Moved {member.name} to AFK")
+        try:
+            await member.send(f"You were moved to {afk_channel.name} due to inactivity.")
+        except:
+            pass
     except Exception as e:
         logger.error(f"Error moving {member.name}: {e}")
 
@@ -748,7 +772,6 @@ async def stats(ctx):
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
     
-    # Music stats
     total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
