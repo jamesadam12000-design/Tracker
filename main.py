@@ -4,10 +4,11 @@ import asyncio
 import aiohttp
 import yt_dlp
 import re
+import json
+import urllib.parse
 from discord.ext import commands, tasks
 from datetime import datetime
 import logging
-import wavelink
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
@@ -27,15 +28,10 @@ SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
 
 # ==================== LAVALINK CONFIGURATION ====================
-# USING YOUR NEW LAVALINK URL
 LAVALINK_HOST = os.environ.get('LAVALINK_HOST', 'lavalink-production-72bc.up.railway.app')
 LAVALINK_PORT = int(os.environ.get('LAVALINK_PORT', '8080'))
 LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
-
-logger.info(f"🎧 Lavalink Configuration:")
-logger.info(f"   Host: {LAVALINK_HOST}")
-logger.info(f"   Port: {LAVALINK_PORT}")
-logger.info(f"   Password: {LAVALINK_PASSWORD}")
+LAVALINK_URL = f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
 
 # ==================== YT-DLP OPTIONS ====================
 YDL_OPTIONS = {
@@ -62,40 +58,14 @@ intents.members = True
 intents.message_content = True
 intents.voice_states = True
 
-class MusicBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents, help_command=None)
-        self.lavalink_connected = False
-    
-    async def setup_hook(self):
-        """Connect to Lavalink when bot starts"""
-        await self.connect_lavalink()
-    
-    async def connect_lavalink(self):
-        """Connect to Lavalink with retries"""
-        try:
-            logger.info(f"🔗 Connecting to Lavalink at {LAVALINK_HOST}:{LAVALINK_PORT}...")
-            
-            nodes = [
-                wavelink.Node(
-                    uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
-                    password=LAVALINK_PASSWORD
-                )
-            ]
-            await wavelink.Pool.connect(nodes=nodes, client=self)
-            self.lavalink_connected = True
-            logger.info(f"✅ Connected to Lavalink at {LAVALINK_HOST}:{LAVALINK_PORT}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to Lavalink: {e}")
-            self.lavalink_connected = False
-            return False
-
-bot = MusicBot()
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ==================== DATA STORAGE ====================
 voice_activity = {}
 music_queues = {}
+music_loop = {}
+lavalink_session_id = None
+lavalink_connected = False
 
 class MusicQueue:
     def __init__(self):
@@ -131,48 +101,176 @@ class MusicQueue:
     def is_empty(self):
         return len(self.queue) == 0
 
-# ==================== CUSTOM LAVALINK PLAYER ====================
+# ==================== LAVALINK HTTP API FUNCTIONS ====================
 
-class LavalinkPlayer(wavelink.Player):
-    """Custom player with queue support"""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.queue = []
-        self.current_track = None
-        self.loop = False
-        self.text_channel = None
-        self.guild_id = None
+async def lavalink_request(endpoint, method='GET', data=None):
+    """Make a request to Lavalink HTTP API"""
+    headers = {
+        'Authorization': LAVALINK_PASSWORD,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
     
-    async def do_next(self):
-        """Play the next track in queue"""
-        if self.loop and self.current_track:
-            track = self.current_track
-        elif self.queue:
-            track = self.queue.pop(0)
-            self.current_track = track
-        else:
-            self.current_track = None
-            if self.guild_id in music_queues:
-                music_queues[self.guild_id].is_playing = False
-            return
+    url = f"{LAVALINK_URL}/{endpoint}"
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            if method == 'GET':
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 401:
+                        logger.error(f"❌ Lavalink 401 - Wrong password: {LAVALINK_PASSWORD}")
+                        return None
+                    else:
+                        logger.error(f"❌ Lavalink error: {resp.status}")
+                        return None
+            elif method == 'POST':
+                async with session.post(url, headers=headers, json=data) as resp:
+                    return resp.status == 200
+            elif method == 'PATCH':
+                async with session.patch(url, headers=headers, json=data) as resp:
+                    return resp.status == 200
+            elif method == 'DELETE':
+                async with session.delete(url, headers=headers) as resp:
+                    return resp.status == 200
+        except Exception as e:
+            logger.error(f"❌ Lavalink request error: {e}")
+            return None
+
+async def lavalink_create_session():
+    """Create a Lavalink session"""
+    global lavalink_session_id, lavalink_connected
+    
+    try:
+        session_data = {
+            "clientName": "DiscordBot",
+            "resumingKey": "discord_bot_resume",
+            "resumingTimeout": 60
+        }
+        result = await lavalink_request("sessions", 'POST', session_data)
+        if result and 'sessionId' in result:
+            lavalink_session_id = result['sessionId']
+            lavalink_connected = True
+            logger.info(f"✅ Lavalink session created: {lavalink_session_id}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"❌ Failed to create Lavalink session: {e}")
+        return False
+
+async def lavalink_connect_voice(guild_id, channel_id):
+    """Connect to voice channel via Lavalink"""
+    if not lavalink_session_id:
+        return False
+    
+    try:
+        voice_data = {
+            "voice": {
+                "sessionId": lavalink_session_id,
+                "channelId": str(channel_id),
+                "guildId": str(guild_id)
+            }
+        }
+        result = await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}/voice",
+            'PATCH',
+            voice_data
+        )
+        return result
+    except Exception as e:
+        logger.error(f"❌ Lavalink connect voice error: {e}")
+        return False
+
+async def lavalink_play_track(guild_id, track_identifier):
+    """Play a track using Lavalink"""
+    if not lavalink_session_id:
+        return False
+    
+    try:
+        # First, load the track
+        load_result = await lavalink_request(f"loadtracks?identifier={track_identifier}")
+        if not load_result or 'tracks' not in load_result or not load_result['tracks']:
+            return False
         
-        await self.play(track)
+        track = load_result['tracks'][0]
+        track_id = track.get('track')
         
-        if self.text_channel:
-            embed = discord.Embed(
-                title="🎵 Now Playing",
-                description=f"**{track.title}**",
-                color=discord.Color.blue()
-            )
-            if track.thumbnail:
-                embed.set_thumbnail(url=track.thumbnail)
-            if track.length:
-                minutes = track.length // 60000
-                seconds = (track.length // 1000) % 60
-                embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-            if track.extras and track.extras.get('requester'):
-                embed.add_field(name="Requested By", value=track.extras.get('requester'), inline=True)
-            await self.text_channel.send(embed=embed)
+        if not track_id:
+            return False
+        
+        # Play the track
+        play_data = {
+            "track": track_id,
+            "noReplace": False
+        }
+        result = await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}/play",
+            'POST',
+            play_data
+        )
+        return result
+    except Exception as e:
+        logger.error(f"❌ Lavalink play error: {e}")
+        return False
+
+async def lavalink_stop_playback(guild_id):
+    """Stop playback in Lavalink"""
+    if not lavalink_session_id:
+        return False
+    
+    try:
+        result = await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}/stop",
+            'POST'
+        )
+        return result
+    except Exception as e:
+        logger.error(f"❌ Lavalink stop error: {e}")
+        return False
+
+async def lavalink_pause_playback(guild_id, pause=True):
+    """Pause/resume playback in Lavalink"""
+    if not lavalink_session_id:
+        return False
+    
+    try:
+        result = await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}/pause",
+            'PATCH',
+            {"paused": pause}
+        )
+        return result
+    except Exception as e:
+        logger.error(f"❌ Lavalink pause error: {e}")
+        return False
+
+async def lavalink_leave_voice(guild_id):
+    """Leave voice channel via Lavalink"""
+    if not lavalink_session_id:
+        return False
+    
+    try:
+        result = await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}",
+            'DELETE'
+        )
+        return result
+    except Exception as e:
+        logger.error(f"❌ Lavalink leave error: {e}")
+        return False
+
+async def lavalink_check_session():
+    """Check if Lavalink session is valid"""
+    if not lavalink_session_id:
+        return False
+    
+    try:
+        result = await lavalink_request(f"sessions/{lavalink_session_id}")
+        return result is not None
+    except Exception as e:
+        logger.error(f"❌ Lavalink check error: {e}")
+        return False
 
 # ==================== SEARCH FUNCTIONS ====================
 
@@ -274,6 +372,60 @@ async def search_spotify(query, requester):
         logger.error(f"Spotify search error: {e}")
         return []
 
+async def play_next(ctx, guild_id):
+    """Play the next song in queue using Lavalink"""
+    if guild_id not in music_queues:
+        return
+    
+    queue = music_queues[guild_id]
+    
+    if queue.loop and queue.current:
+        next_track = queue.current
+    else:
+        next_track = queue.next()
+    
+    if not next_track:
+        queue.is_playing = False
+        await ctx.send("📭 Queue is empty!")
+        return
+    
+    queue.is_playing = True
+    
+    try:
+        # Play using Lavalink
+        success = await lavalink_play_track(guild_id, next_track['url'])
+        
+        if success:
+            await send_now_playing(ctx, next_track)
+        else:
+            await ctx.send(f"❌ Could not play: {next_track['title']}")
+            queue.is_playing = False
+            await play_next(ctx, guild_id)
+        
+    except Exception as e:
+        logger.error(f"Play error: {e}")
+        queue.is_playing = False
+        await play_next(ctx, guild_id)
+
+async def send_now_playing(ctx, track):
+    """Send now playing embed"""
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"**{track['title']}**",
+        color=discord.Color.blue()
+    )
+    if track.get('thumbnail'):
+        embed.set_thumbnail(url=track['thumbnail'])
+    if track.get('duration'):
+        minutes = track['duration'] // 60
+        seconds = track['duration'] % 60
+        embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
+    if track.get('requester'):
+        embed.add_field(name="Requested By", value=track['requester'], inline=True)
+    if track.get('source') == 'spotify' and track.get('spotify_artist'):
+        embed.add_field(name="🎵 Spotify Artist", value=track['spotify_artist'], inline=True)
+    await ctx.send(embed=embed)
+
 # ==================== MUSIC COMMANDS ====================
 
 @bot.command(name="play", aliases=["p"])
@@ -283,23 +435,19 @@ async def play(ctx, *, query):
         await ctx.send("❌ You need to be in a voice channel!")
         return
     
-    if not bot.lavalink_connected:
+    if not lavalink_connected:
         await ctx.send("❌ Bot is not connected to Lavalink. Please wait or check configuration.")
         return
     
     voice_channel = ctx.author.voice.channel
     guild_id = ctx.guild.id
     
-    # Get or create player
-    player = await bot.lavalink.get_player(ctx.guild.id, cls=LavalinkPlayer)
-    player.guild_id = guild_id
-    player.text_channel = ctx.channel
-    
-    if not player.is_connected:
-        await player.connect(voice_channel)
+    # Connect to voice via Lavalink
+    await lavalink_connect_voice(guild_id, voice_channel.id)
     
     if guild_id not in music_queues:
         music_queues[guild_id] = MusicQueue()
+        music_loop[guild_id] = False
     
     queue = music_queues[guild_id]
     
@@ -318,74 +466,73 @@ async def play(ctx, *, query):
             await ctx.send("❌ No results found!")
             return
     
-    # Convert to Wavelink tracks
-    for track_data in tracks:
-        try:
-            search_results = await wavelink.Playable.search(track_data['url'])
-            if search_results:
-                track = search_results[0]
-                track.extras = {'requester': ctx.author.mention}
-                player.queue.append(track)
-                queue.add(track_data)
-        except Exception as e:
-            logger.error(f"Error adding track: {e}")
+    for track in tracks:
+        track['channel_id'] = ctx.channel.id
+        queue.add(track)
     
     if len(tracks) == 1:
         await ctx.send(f"✅ Added to queue: **{tracks[0]['title']}**")
     else:
         await ctx.send(f"✅ Added {len(tracks)} tracks to queue")
     
-    if not player.is_playing and player.queue:
-        await player.do_next()
+    if not queue.is_playing:
+        await play_next(ctx, guild_id)
 
 @bot.command(name="skip")
 async def skip(ctx):
     """Skip the current song"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if not player or not player.is_playing:
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues:
+        await ctx.send("❌ Nothing is playing!")
+        return
+    queue = music_queues[guild_id]
+    if not queue.is_playing:
         await ctx.send("❌ Nothing is playing!")
         return
     
-    await player.stop()
+    await lavalink_stop_playback(guild_id)
+    queue.is_playing = False
     await ctx.send("⏭️ Skipped the current song!")
 
 @bot.command(name="stop")
 async def stop(ctx):
     """Stop playback and clear the queue"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if player:
-        player.queue.clear()
-        player.current_track = None
-        await player.stop()
-        await player.disconnect()
+    guild_id = ctx.guild.id
+    if guild_id in music_queues:
+        queue = music_queues[guild_id]
+        queue.clear()
+        queue.is_playing = False
     
-    if ctx.guild.id in music_queues:
-        music_queues[ctx.guild.id].clear()
-        music_queues[ctx.guild.id].is_playing = False
-    
+    await lavalink_leave_voice(guild_id)
     await ctx.send("⏹️ Stopped playback and cleared queue!")
 
 @bot.command(name="pause")
 async def pause(ctx):
     """Pause the current song"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if not player or not player.is_playing:
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
     
-    await player.pause(True)
-    await ctx.send("⏸️ Paused the current song!")
+    success = await lavalink_pause_playback(guild_id, True)
+    if success:
+        await ctx.send("⏸️ Paused the current song!")
+    else:
+        await ctx.send("❌ Could not pause playback!")
 
 @bot.command(name="resume")
 async def resume(ctx):
     """Resume the current song"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if not player:
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
     
-    await player.pause(False)
-    await ctx.send("▶️ Resumed playback!")
+    success = await lavalink_pause_playback(guild_id, False)
+    if success:
+        await ctx.send("▶️ Resumed playback!")
+    else:
+        await ctx.send("❌ Could not resume playback!")
 
 @bot.command(name="queue", aliases=["q"])
 async def show_queue(ctx):
@@ -414,36 +561,40 @@ async def show_queue(ctx):
 @bot.command(name="loop")
 async def loop(ctx):
     """Toggle loop for the current song"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if not player:
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
-    player.loop = not player.loop
-    await ctx.send(f"🔁 Loop {'enabled' if player.loop else 'disabled'}!")
+    queue = music_queues[guild_id]
+    queue.loop = not queue.loop
+    await ctx.send("🔁 Loop enabled!" if queue.loop else "🔁 Loop disabled!")
 
 @bot.command(name="nowplaying", aliases=["np"])
 async def now_playing(ctx):
     """Show the currently playing song"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if not player or not player.current_track:
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
-    
-    track = player.current_track
-    embed = discord.Embed(
-        title="🎵 Now Playing",
-        description=f"**{track.title}**",
-        color=discord.Color.blue()
-    )
-    if track.thumbnail:
-        embed.set_thumbnail(url=track.thumbnail)
-    if track.length:
-        minutes = track.length // 60000
-        seconds = (track.length // 1000) % 60
-        embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-    if track.author:
-        embed.add_field(name="👤 Artist", value=track.author, inline=True)
-    if player.loop:
+    queue = music_queues[guild_id]
+    if not queue.current or not queue.is_playing:
+        await ctx.send("❌ Nothing is playing!")
+        return
+    track = queue.current
+    embed = discord.Embed(title="🎵 Now Playing", description=f"**{track['title']}**", color=discord.Color.blue())
+    if track.get('thumbnail'):
+        embed.set_thumbnail(url=track['thumbnail'])
+    if track.get('duration'):
+        minutes = track['duration'] // 60
+        seconds = track['duration'] % 60
+        embed.add_field(name="⏱️ Duration", value=f"{minutes}:{seconds:02d}", inline=True)
+    if track.get('uploader'):
+        embed.add_field(name="👤 Uploader", value=track['uploader'], inline=True)
+    if track.get('requester'):
+        embed.add_field(name="📝 Requested By", value=track['requester'], inline=True)
+    if track.get('source') == 'spotify' and track.get('spotify_artist'):
+        embed.add_field(name="🎵 Spotify Artist", value=track['spotify_artist'], inline=True)
+    if queue.loop:
         embed.add_field(name="🔁 Loop", value="Enabled", inline=True)
     await ctx.send(embed=embed)
 
@@ -488,17 +639,12 @@ async def shuffle_queue(ctx):
 @bot.command(name="leave")
 async def leave(ctx):
     """Make the bot leave the voice channel"""
-    player = bot.lavalink.get_player(ctx.guild.id)
-    if player:
-        player.queue.clear()
-        player.current_track = None
-        await player.stop()
-        await player.disconnect()
+    guild_id = ctx.guild.id
+    if guild_id in music_queues:
+        music_queues[guild_id].clear()
+        music_queues[guild_id].is_playing = False
     
-    if ctx.guild.id in music_queues:
-        music_queues[ctx.guild.id].clear()
-        music_queues[ctx.guild.id].is_playing = False
-    
+    await lavalink_leave_voice(guild_id)
     await ctx.send("👋 Left the voice channel!")
 
 # ==================== AFK FUNCTIONS ====================
@@ -601,11 +747,18 @@ async def sync_members():
 
 @bot.event
 async def on_ready():
+    global lavalink_connected
+    
     logger.info(f"✅ {bot.user} is online!")
     logger.info(f"📊 Bot ID: {bot.user.id}")
     logger.info(f"🎵 Music Bot Ready!")
-    logger.info(f"🎧 Lavalink Host: {LAVALINK_HOST}")
-    logger.info(f"🎧 Lavalink Port: {LAVALINK_PORT}")
+    logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
+    
+    # Connect to Lavalink
+    if await lavalink_create_session():
+        logger.info("✅ Lavalink connected successfully!")
+    else:
+        logger.warning("⚠️ Lavalink not available - check your configuration!")
     
     guild = bot.get_guild(GUILD_ID)
     if guild:
@@ -635,7 +788,7 @@ async def ping(ctx):
 @bot.command(name="lavalink")
 async def check_lavalink(ctx):
     """Check Lavalink connection status"""
-    if bot.lavalink_connected:
+    if lavalink_connected:
         await ctx.send("✅ Lavalink is connected!")
     else:
         await ctx.send("❌ Lavalink is NOT connected. Please check configuration.")
@@ -661,7 +814,7 @@ async def stats(ctx):
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
     
     # Lavalink status
-    embed.add_field(name="🎧 Lavalink", value="✅ Connected" if bot.lavalink_connected else "❌ Disconnected", inline=True)
+    embed.add_field(name="🎧 Lavalink", value="✅ Connected" if lavalink_connected else "❌ Disconnected", inline=True)
     
     embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
@@ -717,5 +870,5 @@ if __name__ == "__main__":
         print("⚠️ WARNING: GUILD_ID not set!")
     
     print(f"🚀 Starting bot...")
-    print(f"🎧 Lavalink: {LAVALINK_HOST}:{LAVALINK_PORT}")
+    print(f"🎧 Lavalink: {LAVALINK_URL}")
     bot.run(TOKEN, reconnect=True)
