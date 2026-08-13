@@ -464,6 +464,101 @@ async def send_now_playing(ctx, track):
 
 # ==================== VOICE CONNECTION ====================
 
+VOICE_CONNECT_BASE_DELAY = 5      # seconds, delay for attempt 1
+VOICE_CONNECT_MAX_DELAY = 300     # seconds, cap on backoff
+VOICE_CONNECT_MAX_ATTEMPTS = 6    # give up after this many attempts
+
+
+async def connect_voice_with_backoff(voice_channel, max_attempts=VOICE_CONNECT_MAX_ATTEMPTS):
+    """
+    Connect to a Discord voice channel with exponential backoff.
+
+    Handles discord.errors.ConnectionClosed with code 4017 (invalid token) by
+    tearing down any stale voice client/session state before retrying, so the
+    next handshake negotiates a fresh token instead of reusing a stale one.
+    Backoff schedule: 5s, 10s, 20s, 40s, 80s, ... capped at 300s.
+    """
+    guild = voice_channel.guild
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Clean up any stale/half-open voice client before attempting a
+            # fresh connection so we don't leak unclosed connections.
+            existing_vc = guild.voice_client
+            if existing_vc is not None:
+                try:
+                    await existing_vc.disconnect(force=True)
+                except Exception as cleanup_error:
+                    logger.warning(f"⚠️ Error cleaning up stale voice client: {cleanup_error}")
+                await asyncio.sleep(0.5)
+
+            logger.info(
+                f"🔄 Voice connect attempt {attempt}/{max_attempts} to '{voice_channel.name}'"
+            )
+            voice_client = await voice_channel.connect(timeout=20.0, reconnect=True)
+            await asyncio.sleep(1.5)
+
+            if voice_client and voice_client.is_connected():
+                logger.info(f"✅ Connected to {voice_channel.name} on attempt {attempt}")
+                return voice_client, None
+
+            # Got a voice client object but it never actually connected.
+            if voice_client:
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+            last_error = "Voice client failed to reach a connected state"
+
+        except discord.errors.ConnectionClosed as e:
+            last_error = e
+            code = getattr(e, "code", None)
+            if code == 4017:
+                logger.error(
+                    f"❌ Voice WebSocket closed with 4017 (invalid token) on attempt "
+                    f"{attempt}/{max_attempts}. Resetting voice session state before retrying."
+                )
+                # Force-clear stale voice state so Discord issues a fresh
+                # token/session on the next handshake instead of reusing one
+                # that is already mismatched/expired.
+                stale_vc = guild.voice_client
+                if stale_vc is not None:
+                    try:
+                        await stale_vc.disconnect(force=True)
+                    except Exception as cleanup_error:
+                        logger.warning(f"⚠️ Error during 4017 cleanup: {cleanup_error}")
+                try:
+                    await guild.change_voice_state(channel=None)
+                    await asyncio.sleep(1)
+                except Exception as vs_error:
+                    logger.warning(f"⚠️ Could not reset voice state: {vs_error}")
+            else:
+                logger.error(
+                    f"❌ Voice WebSocket closed with code {code} on attempt "
+                    f"{attempt}/{max_attempts}: {e}"
+                )
+
+        except Exception as e:
+            last_error = e
+            logger.error(
+                f"❌ Unexpected error connecting to voice on attempt {attempt}/{max_attempts}: {e}"
+            )
+
+        if attempt < max_attempts:
+            delay = min(VOICE_CONNECT_BASE_DELAY * (2 ** (attempt - 1)), VOICE_CONNECT_MAX_DELAY)
+            logger.info(
+                f"⏳ Backing off for {delay}s before retry {attempt + 1}/{max_attempts}"
+            )
+            await asyncio.sleep(delay)
+
+    logger.error(
+        f"❌ Giving up on voice channel '{voice_channel.name}' after {max_attempts} attempts. "
+        f"Last error: {last_error}"
+    )
+    return None, last_error
+
+
 async def connect_voice(ctx):
     """Connect to voice channel"""
     if not ctx.author.voice:
@@ -484,16 +579,11 @@ async def connect_voice(ctx):
         await ctx.voice_client.disconnect()
         await asyncio.sleep(1)
     
-    try:
-        voice_client = await voice_channel.connect(timeout=20.0, reconnect=True)
-        await asyncio.sleep(1.5)
-        if voice_client and voice_client.is_connected():
-            logger.info(f"✅ Connected to {voice_channel.name}")
-            return voice_client, None
-    except Exception as e:
-        return None, f"❌ Failed to connect: {str(e)}"
+    voice_client, error = await connect_voice_with_backoff(voice_channel)
+    if voice_client:
+        return voice_client, None
     
-    return None, "❌ Could not connect to voice channel"
+    return None, f"❌ Failed to connect after {VOICE_CONNECT_MAX_ATTEMPTS} attempts: {error}"
 
 # ==================== MUSIC COMMANDS ====================
 
