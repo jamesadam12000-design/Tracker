@@ -5,8 +5,9 @@ import aiohttp
 import yt_dlp
 import re
 from discord.ext import commands, tasks
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
+import json
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,12 @@ AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))
 # Spotify API
 SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
+
+# Lavalink Configuration
+LAVALINK_HOST = os.environ.get('LAVALINK_HOST', os.environ.get('LAVALINK_HOSTNAME', 'localhost'))
+LAVALINK_PORT = int(os.environ.get('LAVALINK_PORT', '8080'))
+LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
+LAVALINK_URL = f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
 
 # ==================== YT-DLP OPTIONS ====================
 FFMPEG_OPTIONS = {
@@ -122,10 +129,48 @@ async def connect_voice(ctx):
     
     return None, "❌ Could not connect to voice channel"
 
+# ==================== LAVALINK FUNCTIONS ====================
+
+async def lavalink_request(endpoint, method='GET', data=None):
+    """Make a request to Lavalink"""
+    headers = {
+        'Authorization': LAVALINK_PASSWORD,
+        'Content-Type': 'application/json'
+    }
+    
+    url = f"{LAVALINK_URL}/{endpoint}"
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            if method == 'GET':
+                async with session.get(url, headers=headers) as resp:
+                    return await resp.json() if resp.status == 200 else None
+            elif method == 'POST':
+                async with session.post(url, headers=headers, json=data) as resp:
+                    return resp.status == 200
+            elif method == 'PATCH':
+                async with session.patch(url, headers=headers, json=data) as resp:
+                    return resp.status == 200
+            elif method == 'DELETE':
+                async with session.delete(url, headers=headers) as resp:
+                    return resp.status == 200
+        except Exception as e:
+            logger.error(f"Lavalink request error: {e}")
+            return None
+
+async def lavalink_load_tracks(query):
+    """Load tracks from Lavalink"""
+    try:
+        result = await lavalink_request(f"loadtracks?identifier={query}")
+        return result
+    except Exception as e:
+        logger.error(f"Error loading tracks: {e}")
+        return None
+
 # ==================== SEARCH FUNCTIONS ====================
 
 async def search_youtube(query, requester):
-    """Search YouTube for tracks"""
+    """Search YouTube for tracks using yt-dlp"""
     try:
         youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
         
@@ -185,7 +230,6 @@ async def search_spotify(query, requester):
         ))
         
         if "open.spotify.com" in query:
-            # Playlist
             if "playlist" in query:
                 playlist_id = query.split("playlist/")[1].split("?")[0]
                 results = sp.playlist_tracks(playlist_id)
@@ -198,8 +242,6 @@ async def search_spotify(query, requester):
                             yt_tracks[0]['source'] = 'spotify'
                             yt_tracks[0]['spotify_artist'] = track['artists'][0]['name']
                             tracks.append(yt_tracks[0])
-            
-            # Single track
             elif "track" in query:
                 track_id = query.split("track/")[1].split("?")[0]
                 result = sp.track(track_id)
@@ -209,8 +251,6 @@ async def search_spotify(query, requester):
                     yt_tracks[0]['source'] = 'spotify'
                     yt_tracks[0]['spotify_artist'] = result['artists'][0]['name']
                     tracks.append(yt_tracks[0])
-            
-            # Album
             elif "album" in query:
                 album_id = query.split("album/")[1].split("?")[0]
                 results = sp.album_tracks(album_id)
@@ -222,7 +262,6 @@ async def search_spotify(query, requester):
                         yt_tracks[0]['spotify_artist'] = item['artists'][0]['name']
                         tracks.append(yt_tracks[0])
         else:
-            # Search query - search Spotify then find on YouTube
             results = sp.search(q=query, type='track', limit=5)
             for item in results['tracks']['items']:
                 search_query = f"{item['name']} {item['artists'][0]['name']}"
@@ -275,6 +314,25 @@ async def play_next(ctx, guild_id):
     queue.is_playing = True
     
     try:
+        # Try to use Lavalink first
+        if LAVALINK_HOST != 'localhost':
+            try:
+                # Get audio URL from Lavalink
+                load_result = await lavalink_load_tracks(next_track['url'])
+                if load_result and 'tracks' in load_result and load_result['tracks']:
+                    track_data = load_result['tracks'][0]
+                    audio_url = track_data.get('info', {}).get('uri')
+                    if audio_url:
+                        audio_source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
+                        voice_client.play(audio_source, after=lambda e: asyncio.run_coroutine_threadsafe(
+                            play_next(ctx, guild_id), bot.loop
+                        ))
+                        await send_now_playing(ctx, next_track)
+                        return
+            except Exception as e:
+                logger.warning(f"Lavalink failed, falling back to yt-dlp: {e}")
+        
+        # Fallback: Use yt-dlp directly
         audio_url = await get_audio_url(next_track['url'])
         
         if not audio_url:
@@ -294,29 +352,31 @@ async def play_next(ctx, guild_id):
             )
         
         voice_client.play(audio_source, after=after_play)
-        
-        # Send now playing message
-        embed = discord.Embed(
-            title="🎵 Now Playing",
-            description=f"**{next_track['title']}**",
-            color=discord.Color.blue()
-        )
-        if next_track.get('thumbnail'):
-            embed.set_thumbnail(url=next_track['thumbnail'])
-        if next_track.get('duration'):
-            minutes = next_track['duration'] // 60
-            seconds = next_track['duration'] % 60
-            embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-        if next_track.get('requester'):
-            embed.add_field(name="Requested By", value=next_track['requester'], inline=True)
-        if next_track.get('source') == 'spotify' and next_track.get('spotify_artist'):
-            embed.add_field(name="🎵 Spotify Artist", value=next_track['spotify_artist'], inline=True)
-        await ctx.send(embed=embed)
+        await send_now_playing(ctx, next_track)
         
     except Exception as e:
         logger.error(f"Play error: {e}")
         queue.is_playing = False
         await play_next(ctx, guild_id)
+
+async def send_now_playing(ctx, track):
+    """Send now playing embed"""
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"**{track['title']}**",
+        color=discord.Color.blue()
+    )
+    if track.get('thumbnail'):
+        embed.set_thumbnail(url=track['thumbnail'])
+    if track.get('duration'):
+        minutes = track['duration'] // 60
+        seconds = track['duration'] % 60
+        embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
+    if track.get('requester'):
+        embed.add_field(name="Requested By", value=track['requester'], inline=True)
+    if track.get('source') == 'spotify' and track.get('spotify_artist'):
+        embed.add_field(name="🎵 Spotify Artist", value=track['spotify_artist'], inline=True)
+    await ctx.send(embed=embed)
 
 # ==================== MUSIC COMMANDS ====================
 
@@ -340,7 +400,6 @@ async def play(ctx, *, query):
     
     tracks = []
     
-    # Check if it's a Spotify URL or search
     if "spotify.com" in query or "open.spotify.com" in query:
         tracks = await search_spotify(query, ctx.author.mention)
         if not tracks:
@@ -532,10 +591,6 @@ async def move_to_afk(member, afk_channel):
         await asyncio.sleep(0.5)
         await member.edit(mute=True, deafen=True)
         logger.info(f"Moved {member.name} to AFK")
-        try:
-            await member.send(f"You were moved to {afk_channel.name} due to inactivity.")
-        except:
-            pass
     except Exception as e:
         logger.error(f"Error moving {member.name}: {e}")
 
@@ -570,10 +625,9 @@ async def check_afk(member):
             if afk_channel:
                 await move_to_afk(member, afk_channel)
 
-# ==================== PRESENCE FUNCTIONS - CONTINUOUS TRACKING ====================
+# ==================== PRESENCE FUNCTIONS ====================
 
 async def update_member_presence(member):
-    """Update member presence to your API"""
     try:
         status_map = {
             discord.Status.online: "online",
@@ -584,84 +638,45 @@ async def update_member_presence(member):
         status = status_map.get(member.status, "offline")
         
         activities = []
-        custom_status = None
         
         for activity in member.activities:
-            if activity.type == discord.ActivityType.custom:
-                custom_status = {
-                    "state": activity.state,
-                    "emoji": str(activity.emoji) if activity.emoji else None
-                }
-            elif activity.type == discord.ActivityType.playing:
-                activities.append({
-                    "type": "game",
-                    "name": activity.name,
-                    "details": getattr(activity, "details", None),
-                    "state": getattr(activity, "state", None)
-                })
+            if activity.type == discord.ActivityType.playing:
+                activities.append({"type": "game", "name": activity.name})
             elif activity.type == discord.ActivityType.listening:
                 if activity.name == "Spotify":
                     activities.append({
                         "type": "spotify",
                         "song": getattr(activity, "title", "Unknown"),
-                        "artist": getattr(activity, "artist", "Unknown"),
-                        "album": getattr(activity, "album", "Unknown")
+                        "artist": getattr(activity, "artist", "Unknown")
                     })
-                else:
-                    activities.append({"type": "listening", "name": activity.name})
-            elif activity.type == discord.ActivityType.watching:
-                activities.append({"type": "watching", "name": activity.name})
-            elif activity.type == discord.ActivityType.streaming:
-                activities.append({
-                    "type": "streaming",
-                    "name": activity.name,
-                    "url": getattr(activity, "url", None)
-                })
         
-        if activities or custom_status or status != "offline":
+        if activities:
             payload = {
                 "discord_id": str(member.id),
                 "username": member.name,
-                "global_name": member.global_name,
-                "avatar": str(member.avatar.url) if member.avatar else None,
                 "status": status,
-                "custom_status": custom_status,
                 "activities": activities,
                 "last_updated": datetime.now().isoformat()
             }
-            
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
                 async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
                     if resp.status == 200:
                         logger.info(f"✅ Updated {member.name}: {status}")
-                    else:
-                        logger.warning(f"⚠️ API returned {resp.status} for {member.name}")
     except Exception as e:
-        logger.error(f"❌ Error updating {member.name}: {e}")
+        logger.error(f"Error updating {member.name}: {e}")
 
-# ==================== CONTINUOUS MEMBER SYNC TASK ====================
-
-@tasks.loop(minutes=5)  # Sync every 5 minutes
+@tasks.loop(minutes=5)
 async def sync_members():
-    """Continuously sync all members' presence"""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
-        logger.warning("⚠️ Guild not found for sync")
         return
     
     logger.info(f"🔄 Syncing {len(guild.members)} members...")
-    
     for member in guild.members:
         if not member.bot:
-            try:
-                await update_member_presence(member)
-            except Exception as e:
-                logger.error(f"❌ Error syncing {member.name}: {e}")
-        
-        # Add small delay to avoid rate limits
-        await asyncio.sleep(0.1)
-    
+            await update_member_presence(member)
+            await asyncio.sleep(0.1)
     logger.info("✅ Sync complete!")
 
 # ==================== BOT EVENTS ====================
@@ -677,48 +692,38 @@ async def on_ready():
         logger.info(f"📋 Connected to server: {guild.name}")
         logger.info(f"👥 Members: {len(guild.members)}")
         
-        # Initial sync
-        logger.info("🔄 Running initial member sync...")
         for member in guild.members:
             if not member.bot:
                 await update_member_presence(member)
-                await asyncio.sleep(0.1)  # Rate limit prevention
+                await asyncio.sleep(0.1)
         
-        logger.info("✅ Initial sync complete!")
-        
-        # Start continuous sync task
         sync_members.start()
         logger.info("✅ Continuous member sync started (every 5 minutes)")
-    else:
-        logger.error(f"❌ Could not find server with ID {GUILD_ID}")
+    
+    # Test Lavalink connection
+    try:
+        result = await lavalink_request("version")
+        if result:
+            logger.info(f"✅ Lavalink connected at {LAVALINK_URL}")
+        else:
+            logger.warning("⚠️ Lavalink not available, using yt-dlp fallback")
+    except:
+        logger.warning("⚠️ Lavalink not available, using yt-dlp fallback")
 
 @bot.event
 async def on_presence_update(before, after):
-    """Triggered when a member's presence changes - REAL-TIME tracking"""
     if not after.bot:
-        logger.info(f"🔄 Real-time presence update for {after.name}")
         await update_member_presence(after)
-
-@bot.event
-async def on_member_update(before, after):
-    """Triggered when a member's anything updates"""
-    if not after.bot:
-        # Check if presence changed
-        if before.status != after.status or before.activities != after.activities:
-            logger.info(f"🔄 Member update for {after.name}")
-            await update_member_presence(after)
 
 # ==================== BASIC COMMANDS ====================
 
 @bot.command(name="ping")
 async def ping(ctx):
-    """Check bot latency"""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
 @bot.command(name="stats")
 async def stats(ctx):
-    """Show bot statistics"""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         await ctx.send("❌ Not connected to server")
@@ -733,29 +738,15 @@ async def stats(ctx):
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
     
-    # Music stats
     total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
     
-    # Sync status
-    embed.add_field(name="🔄 Auto Sync", value="✅ Every 5 minutes", inline=True)
-    embed.add_field(name="📡 Real-time Updates", value="✅ Enabled", inline=True)
-    
     embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
 
-@bot.command(name="syncnow")
-@commands.has_permissions(administrator=True)
-async def sync_now(ctx):
-    """Force a manual member sync (Admin only)"""
-    await ctx.send("🔄 Forcing manual sync...")
-    await sync_members()
-    await ctx.send("✅ Manual sync complete!")
-
 @bot.command(name="help")
 async def help_command(ctx):
-    """Show all commands"""
     embed = discord.Embed(
         title="🎵 Music Bot Commands",
         description="Here are all available commands:",
@@ -777,8 +768,7 @@ async def help_command(ctx):
         "!leave": "Bot leaves the voice channel",
         "!ping": "Check bot latency",
         "!stats": "Show bot statistics",
-        "!help": "Show this help message",
-        "!syncnow": "Force manual member sync (Admin only)"
+        "!help": "Show this help message"
     }
     
     text = ""
@@ -786,28 +776,23 @@ async def help_command(ctx):
         text += f"**{cmd}** - {desc}\n"
     
     embed.add_field(name="📋 Commands", value=text, inline=False)
-    embed.set_footer(text="🎶 Enjoy the music! | Auto-sync every 5 minutes")
+    embed.set_footer(text="🎶 Enjoy the music!")
     await ctx.send(embed=embed)
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
-    elif isinstance(error, commands.MissingPermissions):
-        await ctx.send(f"❌ You don't have permission to use this command!")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"❌ Invalid argument: {error}")
-    else:
-        logger.error(f"Command error: {error}")
-        await ctx.send(f"❌ An error occurred: {str(error)}")
+    logger.error(f"Command error: {error}")
+    await ctx.send(f"❌ Error: {str(error)}")
 
-# ==================== RUN THE BOT ====================
+# ==================== RUN ====================
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ ERROR: DISCORD_BOT_TOKEN not set!")
         exit(1)
     if GUILD_ID == 0:
-        print("⚠️ WARNING: GUILD_ID not set! Some features may not work.")
+        print("⚠️ WARNING: GUILD_ID not set!")
     
-    print("🚀 Starting bot...")
+    print(f"🚀 Starting bot with Lavalink at {LAVALINK_URL}...")
     bot.run(TOKEN, reconnect=True)
