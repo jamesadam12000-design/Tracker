@@ -24,8 +24,8 @@ AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '1537088478687531168'))
 AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))
 
 # Spotify API
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
+SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
 # ==================== LAVALINK CONFIGURATION ====================
 LAVALINK_HOST = os.environ.get('LAVALINK_HOST', 'lavalink-production-72bc.up.railway.app')
@@ -258,18 +258,6 @@ async def lavalink_leave_voice(guild_id):
         return result
     except Exception as e:
         logger.error(f"❌ Lavalink leave error: {e}")
-        return False
-
-async def lavalink_check_session():
-    """Check if Lavalink session is valid"""
-    if not lavalink_session_id:
-        return False
-    
-    try:
-        result = await lavalink_request(f"sessions/{lavalink_session_id}")
-        return result is not None
-    except Exception as e:
-        logger.error(f"❌ Lavalink check error: {e}")
         return False
 
 # ==================== SEARCH FUNCTIONS ====================
@@ -660,6 +648,7 @@ async def move_to_afk(member, afk_channel):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    """Track voice state changes for AFK management"""
     if member.bot or not AFK_CHANNEL_ID:
         return
     
@@ -689,9 +678,10 @@ async def check_afk(member):
             if afk_channel:
                 await move_to_afk(member, afk_channel)
 
-# ==================== PRESENCE FUNCTIONS ====================
+# ==================== PRESENCE FUNCTIONS - CONTINUOUS TRACKING ====================
 
 async def update_member_presence(member):
+    """Update member presence to your API"""
     try:
         status_map = {
             discord.Status.online: "online",
@@ -702,45 +692,84 @@ async def update_member_presence(member):
         status = status_map.get(member.status, "offline")
         
         activities = []
+        custom_status = None
         
         for activity in member.activities:
-            if activity.type == discord.ActivityType.playing:
-                activities.append({"type": "game", "name": activity.name})
+            if activity.type == discord.ActivityType.custom:
+                custom_status = {
+                    "state": activity.state,
+                    "emoji": str(activity.emoji) if activity.emoji else None
+                }
+            elif activity.type == discord.ActivityType.playing:
+                activities.append({
+                    "type": "game",
+                    "name": activity.name,
+                    "details": getattr(activity, "details", None),
+                    "state": getattr(activity, "state", None)
+                })
             elif activity.type == discord.ActivityType.listening:
                 if activity.name == "Spotify":
                     activities.append({
                         "type": "spotify",
                         "song": getattr(activity, "title", "Unknown"),
-                        "artist": getattr(activity, "artist", "Unknown")
+                        "artist": getattr(activity, "artist", "Unknown"),
+                        "album": getattr(activity, "album", "Unknown")
                     })
+                else:
+                    activities.append({"type": "listening", "name": activity.name})
+            elif activity.type == discord.ActivityType.watching:
+                activities.append({"type": "watching", "name": activity.name})
+            elif activity.type == discord.ActivityType.streaming:
+                activities.append({
+                    "type": "streaming",
+                    "name": activity.name,
+                    "url": getattr(activity, "url", None)
+                })
         
-        if activities:
+        if activities or custom_status or status != "offline":
             payload = {
                 "discord_id": str(member.id),
                 "username": member.name,
+                "global_name": member.global_name,
+                "avatar": str(member.avatar.url) if member.avatar else None,
                 "status": status,
+                "custom_status": custom_status,
                 "activities": activities,
                 "last_updated": datetime.now().isoformat()
             }
+            
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
                 async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
                     if resp.status == 200:
                         logger.info(f"✅ Updated {member.name}: {status}")
+                    else:
+                        logger.warning(f"⚠️ API returned {resp.status} for {member.name}")
     except Exception as e:
-        logger.error(f"Error updating {member.name}: {e}")
+        logger.error(f"❌ Error updating {member.name}: {e}")
+
+# ==================== CONTINUOUS MEMBER SYNC TASK ====================
 
 @tasks.loop(minutes=5)
 async def sync_members():
+    """Continuously sync all members' presence"""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
+        logger.warning("⚠️ Guild not found for sync")
         return
     
     logger.info(f"🔄 Syncing {len(guild.members)} members...")
+    
     for member in guild.members:
         if not member.bot:
-            await update_member_presence(member)
-            await asyncio.sleep(0.1)
+            try:
+                await update_member_presence(member)
+            except Exception as e:
+                logger.error(f"❌ Error syncing {member.name}: {e}")
+        
+        # Add small delay to avoid rate limits
+        await asyncio.sleep(0.1)
+    
     logger.info("✅ Sync complete!")
 
 # ==================== BOT EVENTS ====================
@@ -765,36 +794,48 @@ async def on_ready():
         logger.info(f"📋 Connected to server: {guild.name}")
         logger.info(f"👥 Members: {len(guild.members)}")
         
+        # Initial sync
+        logger.info("🔄 Running initial member sync...")
         for member in guild.members:
             if not member.bot:
                 await update_member_presence(member)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1)  # Rate limit prevention
         
+        logger.info("✅ Initial sync complete!")
+        
+        # Start continuous sync task
         sync_members.start()
         logger.info("✅ Continuous member sync started (every 5 minutes)")
+    else:
+        logger.error(f"❌ Could not find server with ID {GUILD_ID}")
 
 @bot.event
 async def on_presence_update(before, after):
+    """Triggered when a member's presence changes - REAL-TIME tracking"""
     if not after.bot:
+        logger.info(f"🔄 Real-time presence update for {after.name}")
         await update_member_presence(after)
+
+@bot.event
+async def on_member_update(before, after):
+    """Triggered when a member's anything updates"""
+    if not after.bot:
+        # Check if presence changed
+        if before.status != after.status or before.activities != after.activities:
+            logger.info(f"🔄 Member update for {after.name}")
+            await update_member_presence(after)
 
 # ==================== BASIC COMMANDS ====================
 
 @bot.command(name="ping")
 async def ping(ctx):
+    """Check bot latency"""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
-@bot.command(name="lavalink")
-async def check_lavalink(ctx):
-    """Check Lavalink connection status"""
-    if lavalink_connected:
-        await ctx.send("✅ Lavalink is connected!")
-    else:
-        await ctx.send("❌ Lavalink is NOT connected. Please check configuration.")
-
 @bot.command(name="stats")
 async def stats(ctx):
+    """Show bot statistics"""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         await ctx.send("❌ Not connected to server")
@@ -809,6 +850,7 @@ async def stats(ctx):
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
     
+    # Music stats
     total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
@@ -816,11 +858,46 @@ async def stats(ctx):
     # Lavalink status
     embed.add_field(name="🎧 Lavalink", value="✅ Connected" if lavalink_connected else "❌ Disconnected", inline=True)
     
+    # Sync status
+    embed.add_field(name="🔄 Auto Sync", value="✅ Every 5 minutes", inline=True)
+    embed.add_field(name="📡 Real-time Updates", value="✅ Enabled", inline=True)
+    
     embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
 
+@bot.command(name="syncnow")
+@commands.has_permissions(administrator=True)
+async def sync_now(ctx):
+    """Force a manual member sync (Admin only)"""
+    await ctx.send("🔄 Forcing manual sync...")
+    await sync_members()
+    await ctx.send("✅ Manual sync complete!")
+
+@bot.command(name="lavalink")
+async def check_lavalink(ctx):
+    """Check Lavalink connection status"""
+    if lavalink_connected:
+        embed = discord.Embed(
+            title="🎧 Lavalink Status",
+            description="✅ Lavalink is connected!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
+        embed.add_field(name="Session ID", value=lavalink_session_id or "None", inline=False)
+        await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(
+            title="🎧 Lavalink Status",
+            description="❌ Lavalink is NOT connected!",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
+        embed.add_field(name="Password", value="✅ Set" if LAVALINK_PASSWORD else "❌ Not set", inline=False)
+        await ctx.send(embed=embed)
+
 @bot.command(name="help")
 async def help_command(ctx):
+    """Show all commands"""
     embed = discord.Embed(
         title="🎵 Music Bot Commands",
         description="Here are all available commands:",
@@ -843,6 +920,7 @@ async def help_command(ctx):
         "!lavalink": "Check Lavalink connection status",
         "!ping": "Check bot latency",
         "!stats": "Show bot statistics",
+        "!syncnow": "Force manual member sync (Admin only)",
         "!help": "Show this help message"
     }
     
@@ -851,24 +929,36 @@ async def help_command(ctx):
         text += f"**{cmd}** - {desc}\n"
     
     embed.add_field(name="📋 Commands", value=text, inline=False)
-    embed.set_footer(text="🎶 Enjoy the music!")
+    embed.add_field(
+        name="📡 Member Tracking",
+        value="• Real-time presence updates\n• Auto-sync every 5 minutes\n• Manual sync with !syncnow",
+        inline=False
+    )
+    embed.set_footer(text="🎶 Enjoy the music! | Auto-sync every 5 minutes")
     await ctx.send(embed=embed)
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
-    logger.error(f"Command error: {error}")
-    await ctx.send(f"❌ Error: {str(error)}")
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send(f"❌ You don't have permission to use this command!")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Invalid argument: {error}")
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send(f"❌ An error occurred: {str(error)}")
 
-# ==================== RUN ====================
+# ==================== RUN THE BOT ====================
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ ERROR: DISCORD_BOT_TOKEN not set!")
         exit(1)
     if GUILD_ID == 0:
-        print("⚠️ WARNING: GUILD_ID not set!")
+        print("⚠️ WARNING: GUILD_ID not set! Some features may not work.")
     
     print(f"🚀 Starting bot...")
-    print(f"🎧 Lavalink: {LAVALINK_URL}")
+    print(f"🎧 Lavalink URL: {LAVALINK_URL}")
+    print(f"📡 Member tracking: Enabled (auto-sync every 5 minutes)")
+    print(f"🎙️ AFK management: {'Enabled' if AFK_CHANNEL_ID else 'Disabled'}")
     bot.run(TOKEN, reconnect=True)
