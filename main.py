@@ -7,7 +7,6 @@ import re
 from discord.ext import commands, tasks
 from datetime import datetime
 import logging
-import json
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
@@ -23,11 +22,11 @@ AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '1537088478687531168'))
 AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))
 
 # Spotify API
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
+SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
-# Lavalink Configuration
-LAVALINK_HOST = os.environ.get('LAVALINK_HOST', os.environ.get('LAVALINK_HOSTNAME', 'localhost'))
+# Lavalink Configuration - USING YOUR URL
+LAVALINK_HOST = os.environ.get('LAVALINK_HOST', 'lavalink-production-94c3.up.railway.app')
 LAVALINK_PORT = int(os.environ.get('LAVALINK_PORT', '8080'))
 LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
 LAVALINK_URL = f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
@@ -144,7 +143,9 @@ async def lavalink_request(endpoint, method='GET', data=None):
         try:
             if method == 'GET':
                 async with session.get(url, headers=headers) as resp:
-                    return await resp.json() if resp.status == 200 else None
+                    if resp.status == 200:
+                        return await resp.json()
+                    return None
             elif method == 'POST':
                 async with session.post(url, headers=headers, json=data) as resp:
                     return resp.status == 200
@@ -170,7 +171,7 @@ async def lavalink_load_tracks(query):
 # ==================== SEARCH FUNCTIONS ====================
 
 async def search_youtube(query, requester):
-    """Search YouTube for tracks using yt-dlp"""
+    """Search YouTube for tracks"""
     try:
         youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
         
@@ -251,16 +252,6 @@ async def search_spotify(query, requester):
                     yt_tracks[0]['source'] = 'spotify'
                     yt_tracks[0]['spotify_artist'] = result['artists'][0]['name']
                     tracks.append(yt_tracks[0])
-            elif "album" in query:
-                album_id = query.split("album/")[1].split("?")[0]
-                results = sp.album_tracks(album_id)
-                for item in results['items']:
-                    search_query = f"{item['name']} {item['artists'][0]['name']}"
-                    yt_tracks = await search_youtube(search_query, requester)
-                    if yt_tracks:
-                        yt_tracks[0]['source'] = 'spotify'
-                        yt_tracks[0]['spotify_artist'] = item['artists'][0]['name']
-                        tracks.append(yt_tracks[0])
         else:
             results = sp.search(q=query, type='track', limit=5)
             for item in results['tracks']['items']:
@@ -314,10 +305,9 @@ async def play_next(ctx, guild_id):
     queue.is_playing = True
     
     try:
-        # Try to use Lavalink first
+        # Try Lavalink first
         if LAVALINK_HOST != 'localhost':
             try:
-                # Get audio URL from Lavalink
                 load_result = await lavalink_load_tracks(next_track['url'])
                 if load_result and 'tracks' in load_result and load_result['tracks']:
                     track_data = load_result['tracks'][0]
@@ -330,9 +320,9 @@ async def play_next(ctx, guild_id):
                         await send_now_playing(ctx, next_track)
                         return
             except Exception as e:
-                logger.warning(f"Lavalink failed, falling back to yt-dlp: {e}")
+                logger.warning(f"Lavalink failed, using fallback: {e}")
         
-        # Fallback: Use yt-dlp directly
+        # Fallback: yt-dlp
         audio_url = await get_audio_url(next_track['url'])
         
         if not audio_url:
@@ -686,6 +676,7 @@ async def on_ready():
     logger.info(f"✅ {bot.user} is online!")
     logger.info(f"📊 Bot ID: {bot.user.id}")
     logger.info(f"🎵 Music Bot Ready!")
+    logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
     
     guild = bot.get_guild(GUILD_ID)
     if guild:
@@ -704,11 +695,12 @@ async def on_ready():
     try:
         result = await lavalink_request("version")
         if result:
-            logger.info(f"✅ Lavalink connected at {LAVALINK_URL}")
+            logger.info(f"✅ Lavalink connected successfully!")
+            logger.info(f"   Version: {result}")
         else:
             logger.warning("⚠️ Lavalink not available, using yt-dlp fallback")
-    except:
-        logger.warning("⚠️ Lavalink not available, using yt-dlp fallback")
+    except Exception as e:
+        logger.warning(f"⚠️ Lavalink not available: {e}")
 
 @bot.event
 async def on_presence_update(before, after):
@@ -741,6 +733,9 @@ async def stats(ctx):
     total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
+    
+    # Lavalink status
+    embed.add_field(name="🎧 Lavalink", value="✅ Connected", inline=True)
     
     embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
