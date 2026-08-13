@@ -10,15 +10,16 @@ import yt_dlp
 
 # ==================== FIX 4006 ERROR WITH MONKEY PATCH ====================
 import discord
-from discord.ext import commands  # <-- THIS WAS MISSING!
+from discord.ext import commands
 from discord import VoiceClient
 
-# Save original connect method
+# Store original connect method
 _original_connect = VoiceClient.connect
 
-async def _patched_connect(self, *, timeout=None, reconnect=True):
+async def _patched_connect(self, *args, **kwargs):
     """Patched connect method that handles 4006 error properly"""
     try:
+        # Clean up any existing connection
         if hasattr(self, 'ws') and self.ws:
             try:
                 await self.ws.close()
@@ -26,12 +27,14 @@ async def _patched_connect(self, *, timeout=None, reconnect=True):
                 pass
             self.ws = None
         
-        return await _original_connect(self, timeout=timeout, reconnect=reconnect)
+        # Try to connect
+        return await _original_connect(self, *args, **kwargs)
         
     except discord.errors.ConnectionClosed as e:
         if e.code == 4006:
             logging.warning(f"Voice connection closed with 4006, retrying...")
             
+            # Clean up the broken connection
             if hasattr(self, 'ws') and self.ws:
                 try:
                     await self.ws.close()
@@ -39,9 +42,11 @@ async def _patched_connect(self, *, timeout=None, reconnect=True):
                     pass
                 self.ws = None
             
+            # Wait a moment before retrying
             await asyncio.sleep(2)
             
-            return await _original_connect(self, timeout=timeout or 30.0, reconnect=reconnect)
+            # Retry the connection
+            return await _original_connect(self, *args, **kwargs)
         else:
             raise
 
@@ -145,11 +150,16 @@ async def connect_voice(ctx):
     
     voice_channel = ctx.author.voice.channel
     
+    # If already connected to the same channel, return it
     if ctx.voice_client:
         if ctx.voice_client.channel == voice_channel:
             return ctx.voice_client, None
-        await ctx.voice_client.disconnect()
-        await asyncio.sleep(1)
+        # Disconnect from current channel first
+        try:
+            await ctx.voice_client.disconnect()
+            await asyncio.sleep(1)
+        except:
+            pass
     
     for attempt in range(5):
         try:
@@ -163,6 +173,7 @@ async def connect_voice(ctx):
         except discord.errors.ConnectionClosed as e:
             if e.code == 4006:
                 logger.warning(f"4006 error on attempt {attempt + 1}, retrying...")
+                # Clean up
                 if ctx.voice_client:
                     try:
                         await ctx.voice_client.disconnect()
@@ -178,6 +189,23 @@ async def connect_voice(ctx):
                 await asyncio.sleep(2)
                 continue
             return None, "❌ Connection timed out"
+            
+        except discord.errors.ClientException as e:
+            if "Already connected to a voice channel" in str(e):
+                # Try to disconnect and reconnect
+                logger.warning("Already connected, disconnecting first...")
+                if ctx.voice_client:
+                    try:
+                        await ctx.voice_client.disconnect()
+                        await asyncio.sleep(1)
+                    except:
+                        pass
+                continue
+            logger.error(f"Client error on attempt {attempt + 1}: {e}")
+            if attempt < 4:
+                await asyncio.sleep(2)
+                continue
+            return None, f"❌ Client error: {str(e)}"
             
         except Exception as e:
             logger.error(f"Connection attempt {attempt + 1} failed: {e}")
