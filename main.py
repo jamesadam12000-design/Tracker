@@ -7,10 +7,8 @@ import re
 import json
 from discord.ext import commands
 from datetime import datetime, timedelta
-import nacl
 import logging
-import socket
-import struct
+import nacl
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
@@ -57,6 +55,13 @@ intents.members = True
 intents.message_content = True
 intents.voice_states = True
 
+# Try to use the patched version
+try:
+    import pycord_fix_4006
+    logger.info("✅ Using patched discord.py for voice fix")
+except ImportError:
+    logger.warning("⚠️ Patched version not found, using standard discord.py")
+
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ==================== DATA STORAGE ====================
@@ -99,66 +104,74 @@ class MusicQueue:
     def is_empty(self):
         return len(self.queue) == 0
 
-# ==================== FIXED VOICE CONNECTION ====================
+# ==================== PATCHED VOICE CONNECTION ====================
 
-class CustomVoiceClient(discord.VoiceClient):
-    """Custom voice client with fixed UDP connection"""
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._connect_timeout = 30.0
-        self._reconnect_attempts = 5
+class PatchedVoiceClient(discord.VoiceClient):
+    """Voice client with the 4006 error fix"""
     
     async def connect(self, *, timeout=None, reconnect=True):
-        """Override connect with better error handling"""
+        """Override connect with the fix for 4006"""
         try:
-            await super().connect(timeout=timeout or self._connect_timeout, reconnect=reconnect)
+            # Disconnect any existing connection
+            if self.ws:
+                await self.ws.close()
+            
+            # Get voice server info
+            state = self.guild.voice_state
+            if not state:
+                raise discord.ClientException("No voice state available")
+            
+            # Create connection
+            await super().connect(timeout=timeout, reconnect=reconnect)
+            
         except discord.errors.ConnectionClosed as e:
             if e.code == 4006:
-                logger.warning("Voice connection closed with 4006, retrying with different endpoint...")
-                # Force a different voice region by reconnecting
-                await self.disconnect()
-                await asyncio.sleep(2)
-                # Try to connect again
-                await super().connect(timeout=timeout or self._connect_timeout, reconnect=reconnect)
+                logger.warning("Voice connection closed with 4006, retrying...")
+                # Clear existing connection state
+                self.ws = None
+                await asyncio.sleep(1)
+                # Retry
+                await super().connect(timeout=timeout, reconnect=reconnect)
             else:
                 raise
 
-# Register custom voice client
-discord.VoiceClient = CustomVoiceClient
+# Replace the default voice client
+discord.VoiceClient = PatchedVoiceClient
 
 async def connect_voice(ctx):
-    """Connect to voice channel with retry logic"""
+    """Connect to voice channel with patched client"""
     if not ctx.author.voice:
         return None, "❌ You need to be in a voice channel!"
     
     voice_channel = ctx.author.voice.channel
     
-    # Try to connect with retries
+    # Disconnect if already connected to a different channel
+    if ctx.voice_client:
+        if ctx.voice_client.channel == voice_channel:
+            return ctx.voice_client, None
+        await ctx.voice_client.disconnect()
+        await asyncio.sleep(1)
+    
+    # Connect with retries
     for attempt in range(3):
         try:
-            if ctx.voice_client:
-                if ctx.voice_client.channel == voice_channel:
-                    return ctx.voice_client, None
-                await ctx.voice_client.disconnect()
-                await asyncio.sleep(1)
-            
-            # Connect with timeout
-            voice_client = await voice_channel.connect(timeout=20.0, reconnect=True)
-            
-            # Wait for connection to stabilize
-            await asyncio.sleep(2)
-            
-            # Verify connection
-            if voice_client and voice_client.is_connected():
+            voice_client = await voice_channel.connect(timeout=15.0, reconnect=True)
+            await asyncio.sleep(1)  # Wait for connection to stabilize
+            if voice_client.is_connected():
+                logger.info(f"✅ Connected to {voice_channel.name}")
                 return voice_client, None
-            
-        except Exception as e:
-            logger.error(f"Voice connection attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                await asyncio.sleep(3)
+        except discord.errors.ConnectionClosed as e:
+            if e.code == 4006 and attempt < 2:
+                logger.warning(f"4006 error, retrying... (attempt {attempt + 1})")
+                await asyncio.sleep(2)
                 continue
-            return None, f"❌ Failed to connect to voice: {str(e)}"
+            return None, f"❌ Voice connection error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+                continue
+            return None, f"❌ Failed to connect: {str(e)}"
     
     return None, "❌ Could not connect to voice channel after multiple attempts"
 
@@ -377,7 +390,7 @@ async def play_next(ctx, guild_id):
         queue.is_playing = False
         await play_next(ctx, guild_id)
 
-# ==================== FIXED PLAY COMMAND ====================
+# ==================== MUSIC COMMANDS ====================
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
@@ -424,10 +437,9 @@ async def play(ctx, *, query):
     if not queue.is_playing:
         await play_next(ctx, guild_id)
 
-# ==================== REST OF COMMANDS ====================
-
 @bot.command(name="skip")
 async def skip(ctx):
+    """Skip the current song"""
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
@@ -441,6 +453,7 @@ async def skip(ctx):
 
 @bot.command(name="stop")
 async def stop(ctx):
+    """Stop playback and clear the queue"""
     guild_id = ctx.guild.id
     if guild_id in music_queues:
         queue = music_queues[guild_id]
@@ -453,6 +466,7 @@ async def stop(ctx):
 
 @bot.command(name="pause")
 async def pause(ctx):
+    """Pause the current song"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send("⏸️ Paused the current song!")
@@ -461,6 +475,7 @@ async def pause(ctx):
 
 @bot.command(name="resume")
 async def resume(ctx):
+    """Resume the current song"""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send("▶️ Resumed playback!")
@@ -469,6 +484,7 @@ async def resume(ctx):
 
 @bot.command(name="queue", aliases=["q"])
 async def show_queue(ctx):
+    """Show the current music queue"""
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         await ctx.send("📭 Queue is empty!")
@@ -491,6 +507,7 @@ async def show_queue(ctx):
 
 @bot.command(name="loop")
 async def loop(ctx):
+    """Toggle loop for the current song"""
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
@@ -501,6 +518,7 @@ async def loop(ctx):
 
 @bot.command(name="nowplaying", aliases=["np"])
 async def now_playing(ctx):
+    """Show the currently playing song"""
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
@@ -527,6 +545,7 @@ async def now_playing(ctx):
 
 @bot.command(name="clearqueue", aliases=["cq"])
 async def clear_queue(ctx):
+    """Clear the music queue"""
     guild_id = ctx.guild.id
     if guild_id in music_queues:
         music_queues[guild_id].clear()
@@ -536,6 +555,7 @@ async def clear_queue(ctx):
 
 @bot.command(name="remove")
 async def remove_from_queue(ctx, position: int):
+    """Remove a song from the queue by position"""
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
         await ctx.send("📭 Queue is empty!")
@@ -548,6 +568,7 @@ async def remove_from_queue(ctx, position: int):
 
 @bot.command(name="shuffle")
 async def shuffle_queue(ctx):
+    """Shuffle the music queue"""
     import random
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
@@ -562,6 +583,7 @@ async def shuffle_queue(ctx):
 
 @bot.command(name="leave")
 async def leave(ctx):
+    """Make the bot leave the voice channel"""
     guild_id = ctx.guild.id
     if guild_id in music_queues:
         music_queues[guild_id].clear()
@@ -622,17 +644,51 @@ async def update_member_presence(member):
                       discord.Status.dnd: "dnd", discord.Status.offline: "offline"}
         status = status_map.get(member.status, "offline")
         activities = []
+        custom_status = None
+        
         for activity in member.activities:
-            if activity.type == discord.ActivityType.playing:
-                activities.append({"type": "game", "name": activity.name})
+            if activity.type == discord.ActivityType.custom:
+                custom_status = {
+                    "state": activity.state,
+                    "emoji": str(activity.emoji) if activity.emoji else None
+                }
+            elif activity.type == discord.ActivityType.playing:
+                activities.append({
+                    "type": "game",
+                    "name": activity.name,
+                    "details": getattr(activity, "details", None),
+                    "state": getattr(activity, "state", None)
+                })
             elif activity.type == discord.ActivityType.listening:
                 if activity.name == "Spotify":
-                    activities.append({"type": "spotify", "song": getattr(activity, "title", "Unknown"),
-                                     "artist": getattr(activity, "artist", "Unknown")})
-        if activities:
-            payload = {"discord_id": str(member.id), "username": member.name, 
-                      "status": status, "activities": activities, 
-                      "last_updated": datetime.now().isoformat()}
+                    activities.append({
+                        "type": "spotify",
+                        "song": getattr(activity, "title", "Unknown"),
+                        "artist": getattr(activity, "artist", "Unknown"),
+                        "album": getattr(activity, "album", "Unknown")
+                    })
+                else:
+                    activities.append({"type": "listening", "name": activity.name})
+            elif activity.type == discord.ActivityType.watching:
+                activities.append({"type": "watching", "name": activity.name})
+            elif activity.type == discord.ActivityType.streaming:
+                activities.append({
+                    "type": "streaming",
+                    "name": activity.name,
+                    "url": getattr(activity, "url", None)
+                })
+        
+        if activities or custom_status or status != "offline":
+            payload = {
+                "discord_id": str(member.id),
+                "username": member.name,
+                "global_name": member.global_name,
+                "avatar": str(member.avatar.url) if member.avatar else None,
+                "status": status,
+                "custom_status": custom_status,
+                "activities": activities,
+                "last_updated": datetime.now().isoformat()
+            }
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
                 async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
@@ -647,14 +703,20 @@ async def update_member_presence(member):
 async def on_ready():
     logger.info(f"✅ {bot.user} is online!")
     logger.info(f"📊 Bot ID: {bot.user.id}")
+    logger.info(f"🎵 Music Bot Ready!")
+    
     guild = bot.get_guild(GUILD_ID)
     if guild:
         logger.info(f"📋 Connected to server: {guild.name}")
         logger.info(f"👥 Members: {len(guild.members)}")
+        
         for member in guild.members:
             if not member.bot:
                 await update_member_presence(member)
+        
         logger.info("✅ Initial sync complete!")
+    else:
+        logger.error(f"❌ Could not find server with ID {GUILD_ID}")
 
 @bot.event
 async def on_presence_update(before, after):
@@ -665,25 +727,44 @@ async def on_presence_update(before, after):
 
 @bot.command(name="ping")
 async def ping(ctx):
+    """Check bot latency"""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
 @bot.command(name="stats")
 async def stats(ctx):
+    """Show bot statistics"""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         await ctx.send("❌ Not connected to server")
         return
-    total = len([m for m in guild.members if not m.bot])
+    
+    total_members = len([m for m in guild.members if not m.bot])
     online = len([m for m in guild.members if m.status != discord.Status.offline and not m.bot])
+    voice_members = len([m for m in guild.members if m.voice and m.voice.channel])
+    
     embed = discord.Embed(title="📊 Bot Statistics", color=discord.Color.blue())
-    embed.add_field(name="👥 Tracked Members", value=str(total), inline=True)
+    embed.add_field(name="👥 Tracked Members", value=str(total_members), inline=True)
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
+    embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
+    
+    # Music stats
+    total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
+    embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
+    embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
+    
+    embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
 
 @bot.command(name="help")
 async def help_command(ctx):
-    embed = discord.Embed(title="🎵 Music Bot Commands", color=discord.Color.blue())
+    """Show all commands"""
+    embed = discord.Embed(
+        title="🎵 Music Bot Commands",
+        description="Here are all available commands:",
+        color=discord.Color.blue()
+    )
+    
     commands_list = {
         "!play / !p": "Play a song from YouTube or Spotify",
         "!skip": "Skip the current song",
@@ -698,25 +779,37 @@ async def help_command(ctx):
         "!shuffle": "Shuffle the music queue",
         "!leave": "Bot leaves the voice channel",
         "!ping": "Check bot latency",
-        "!stats": "Show bot statistics"
+        "!stats": "Show bot statistics",
+        "!help": "Show this help message"
     }
+    
     text = ""
     for cmd, desc in commands_list.items():
         text += f"**{cmd}** - {desc}\n"
+    
     embed.add_field(name="📋 Commands", value=text, inline=False)
+    embed.set_footer(text="🎶 Enjoy the music!")
     await ctx.send(embed=embed)
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
-    logger.error(f"Command error: {error}")
-    await ctx.send(f"❌ Error: {str(error)}")
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send(f"❌ You don't have permission to use this command!")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Invalid argument: {error}")
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send(f"❌ An error occurred: {str(error)}")
 
-# ==================== RUN ====================
+# ==================== RUN THE BOT ====================
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ ERROR: DISCORD_BOT_TOKEN not set!")
         exit(1)
+    if GUILD_ID == 0:
+        print("⚠️ WARNING: GUILD_ID not set! Some features may not work.")
+    
     print("🚀 Starting bot...")
     bot.run(TOKEN, reconnect=True)
