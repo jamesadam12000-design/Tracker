@@ -7,10 +7,12 @@ import re
 import json
 from discord.ext import commands
 from datetime import datetime, timedelta
-import nacl  # Required for voice encryption
+import nacl
 import logging
+import socket
+import struct
 
-# ==================== LOGGING SETUP ====================
+# ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('discord')
 logger.setLevel(logging.INFO)
@@ -62,7 +64,6 @@ voice_activity = {}
 afk_tasks = {}
 music_queues = {}
 music_loop = {}
-music_volumes = {}
 
 class MusicQueue:
     def __init__(self):
@@ -70,13 +71,9 @@ class MusicQueue:
         self.current = None
         self.is_playing = False
         self.loop = False
-        self.volume = 100
     
     def add(self, track):
         self.queue.append(track)
-    
-    def add_front(self, track):
-        self.queue.insert(0, track)
     
     def next(self):
         if self.queue:
@@ -96,14 +93,74 @@ class MusicQueue:
             return self.queue.pop(index)
         return None
     
-    def get_queue(self):
-        return self.queue[:10]
-    
     def size(self):
         return len(self.queue)
     
     def is_empty(self):
         return len(self.queue) == 0
+
+# ==================== FIXED VOICE CONNECTION ====================
+
+class CustomVoiceClient(discord.VoiceClient):
+    """Custom voice client with fixed UDP connection"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._connect_timeout = 30.0
+        self._reconnect_attempts = 5
+    
+    async def connect(self, *, timeout=None, reconnect=True):
+        """Override connect with better error handling"""
+        try:
+            await super().connect(timeout=timeout or self._connect_timeout, reconnect=reconnect)
+        except discord.errors.ConnectionClosed as e:
+            if e.code == 4006:
+                logger.warning("Voice connection closed with 4006, retrying with different endpoint...")
+                # Force a different voice region by reconnecting
+                await self.disconnect()
+                await asyncio.sleep(2)
+                # Try to connect again
+                await super().connect(timeout=timeout or self._connect_timeout, reconnect=reconnect)
+            else:
+                raise
+
+# Register custom voice client
+discord.VoiceClient = CustomVoiceClient
+
+async def connect_voice(ctx):
+    """Connect to voice channel with retry logic"""
+    if not ctx.author.voice:
+        return None, "❌ You need to be in a voice channel!"
+    
+    voice_channel = ctx.author.voice.channel
+    
+    # Try to connect with retries
+    for attempt in range(3):
+        try:
+            if ctx.voice_client:
+                if ctx.voice_client.channel == voice_channel:
+                    return ctx.voice_client, None
+                await ctx.voice_client.disconnect()
+                await asyncio.sleep(1)
+            
+            # Connect with timeout
+            voice_client = await voice_channel.connect(timeout=20.0, reconnect=True)
+            
+            # Wait for connection to stabilize
+            await asyncio.sleep(2)
+            
+            # Verify connection
+            if voice_client and voice_client.is_connected():
+                return voice_client, None
+            
+        except Exception as e:
+            logger.error(f"Voice connection attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(3)
+                continue
+            return None, f"❌ Failed to connect to voice: {str(e)}"
+    
+    return None, "❌ Could not connect to voice channel after multiple attempts"
 
 # ==================== MUSIC FUNCTIONS ====================
 
@@ -144,7 +201,7 @@ async def get_track_info(url, requester):
             return [track]
             
     except Exception as e:
-        print(f"❌ Error getting track info: {e}")
+        logger.error(f"Error getting track info: {e}")
         return None
 
 async def search_youtube(query, requester):
@@ -177,7 +234,7 @@ async def search_youtube(query, requester):
             return tracks
             
     except Exception as e:
-        print(f"❌ YouTube search error: {e}")
+        logger.error(f"YouTube search error: {e}")
         return []
 
 async def search_spotify(query, requester):
@@ -208,8 +265,6 @@ async def search_spotify(query, requester):
                             'url': track['external_urls']['spotify'],
                             'duration': track['duration_ms'] // 1000,
                             'thumbnail': track['album']['images'][0]['url'] if track['album']['images'] else '',
-                            'artist': track['artists'][0]['name'],
-                            'album': track['album']['name'],
                             'requester': requester,
                             'source': 'spotify'
                         }
@@ -222,26 +277,10 @@ async def search_spotify(query, requester):
                     'url': result['external_urls']['spotify'],
                     'duration': result['duration_ms'] // 1000,
                     'thumbnail': result['album']['images'][0]['url'] if result['album']['images'] else '',
-                    'artist': result['artists'][0]['name'],
-                    'album': result['album']['name'],
                     'requester': requester,
                     'source': 'spotify'
                 }
                 tracks.append(track_info)
-            elif "album" in query:
-                album_id = query.split("album/")[1].split("?")[0]
-                results = sp.album_tracks(album_id)
-                for item in results['items']:
-                    track_info = {
-                        'title': f"{item['name']} - {item['artists'][0]['name']}",
-                        'url': item['external_urls']['spotify'],
-                        'duration': item['duration_ms'] // 1000,
-                        'thumbnail': '',
-                        'artist': item['artists'][0]['name'],
-                        'requester': requester,
-                        'source': 'spotify'
-                    }
-                    tracks.append(track_info)
         else:
             results = sp.search(q=query, type='track', limit=5)
             for item in results['tracks']['items']:
@@ -250,8 +289,6 @@ async def search_spotify(query, requester):
                     'url': item['external_urls']['spotify'],
                     'duration': item['duration_ms'] // 1000,
                     'thumbnail': item['album']['images'][0]['url'] if item['album']['images'] else '',
-                    'artist': item['artists'][0]['name'],
-                    'album': item['album']['name'],
                     'requester': requester,
                     'source': 'spotify'
                 }
@@ -260,7 +297,7 @@ async def search_spotify(query, requester):
         return tracks
         
     except Exception as e:
-        print(f"❌ Spotify search error: {e}")
+        logger.error(f"Spotify search error: {e}")
         return []
 
 async def get_audio_url(url):
@@ -272,7 +309,7 @@ async def get_audio_url(url):
                 return info['url']
             return None
     except Exception as e:
-        print(f"❌ Error getting audio: {e}")
+        logger.error(f"Error getting audio: {e}")
         return None
 
 async def play_next(ctx, guild_id):
@@ -300,7 +337,6 @@ async def play_next(ctx, guild_id):
     queue.is_playing = True
     
     try:
-        # Get audio URL
         audio_url = await get_audio_url(next_track['url'])
         
         if not audio_url:
@@ -309,12 +345,11 @@ async def play_next(ctx, guild_id):
             await play_next(ctx, guild_id)
             return
         
-        # Create audio source with better error handling
         audio_source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
         
         def after_play(error):
             if error:
-                print(f"❌ Playback error: {error}")
+                logger.error(f"Playback error: {error}")
             asyncio.run_coroutine_threadsafe(
                 play_next(ctx, guild_id),
                 bot.loop
@@ -322,7 +357,6 @@ async def play_next(ctx, guild_id):
         
         voice_client.play(audio_source, after=after_play)
         
-        # Send now playing message
         embed = discord.Embed(
             title="🎵 Now Playing",
             description=f"**[{next_track['title']}]({next_track.get('url', '')})**",
@@ -339,7 +373,7 @@ async def play_next(ctx, guild_id):
         await ctx.send(embed=embed)
         
     except Exception as e:
-        await ctx.send(f"❌ Error playing: {str(e)}")
+        logger.error(f"Play error: {e}")
         queue.is_playing = False
         await play_next(ctx, guild_id)
 
@@ -348,36 +382,25 @@ async def play_next(ctx, guild_id):
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
     """Play a song from YouTube or Spotify"""
-    if not ctx.author.voice:
-        await ctx.send("❌ You need to be in a voice channel to play music!")
+    # Connect to voice
+    voice_client, error = await connect_voice(ctx)
+    if error:
+        await ctx.send(error)
         return
     
-    voice_channel = ctx.author.voice.channel
     guild_id = ctx.guild.id
     
-    # Connect to voice channel with better error handling
-    if not ctx.voice_client:
-        try:
-            # Force reconnect with UDP enabled
-            await voice_channel.connect(timeout=10.0, reconnect=True)
-            await asyncio.sleep(2)  # Give time for connection to stabilize
-        except Exception as e:
-            await ctx.send(f"❌ Failed to connect to voice channel: {str(e)}")
-            return
-    
-    # Initialize queue for this guild
+    # Initialize queue
     if guild_id not in music_queues:
         music_queues[guild_id] = MusicQueue()
         music_loop[guild_id] = False
     
     queue = music_queues[guild_id]
     
-    # Search for tracks
     await ctx.send(f"🔍 Searching for: {query}...")
     
     tracks = []
     
-    # Check if it's a Spotify URL
     if "spotify.com" in query or "open.spotify.com" in query:
         tracks = await search_spotify(query, ctx.author.mention)
         if not tracks:
@@ -389,7 +412,6 @@ async def play(ctx, *, query):
             await ctx.send("❌ No results found!")
             return
     
-    # Add tracks to queue
     for track in tracks:
         track['channel_id'] = ctx.channel.id
         queue.add(track)
@@ -399,49 +421,38 @@ async def play(ctx, *, query):
     else:
         await ctx.send(f"✅ Added {len(tracks)} tracks to queue")
     
-    # Start playing if not already playing
     if not queue.is_playing:
         await play_next(ctx, guild_id)
 
-# ==================== REST OF YOUR COMMANDS ====================
+# ==================== REST OF COMMANDS ====================
 
 @bot.command(name="skip")
 async def skip(ctx):
-    """Skip the current song"""
     guild_id = ctx.guild.id
-    
     if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
-    
     queue = music_queues[guild_id]
-    
     if not queue.is_playing or not ctx.voice_client or not ctx.voice_client.is_playing():
         await ctx.send("❌ Nothing is playing!")
         return
-    
     ctx.voice_client.stop()
     await ctx.send("⏭️ Skipped the current song!")
 
 @bot.command(name="stop")
 async def stop(ctx):
-    """Stop playing and clear the queue"""
     guild_id = ctx.guild.id
-    
     if guild_id in music_queues:
         queue = music_queues[guild_id]
         queue.clear()
         queue.is_playing = False
-    
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
-    
     await ctx.send("⏹️ Stopped playback and cleared queue!")
 
 @bot.command(name="pause")
 async def pause(ctx):
-    """Pause the current song"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send("⏸️ Paused the current song!")
@@ -450,7 +461,6 @@ async def pause(ctx):
 
 @bot.command(name="resume")
 async def resume(ctx):
-    """Resume the current song"""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send("▶️ Resumed playback!")
@@ -459,129 +469,78 @@ async def resume(ctx):
 
 @bot.command(name="queue", aliases=["q"])
 async def show_queue(ctx):
-    """Show the current music queue"""
     guild_id = ctx.guild.id
-    
     if guild_id not in music_queues:
         await ctx.send("📭 Queue is empty!")
         return
-    
     queue = music_queues[guild_id]
-    
     if queue.is_empty() and not queue.current:
         await ctx.send("📭 Queue is empty!")
         return
-    
-    embed = discord.Embed(
-        title="🎵 Music Queue",
-        color=discord.Color.blue()
-    )
-    
+    embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.blue())
     if queue.current and queue.is_playing:
-        embed.add_field(
-            name="🎶 Currently Playing",
-            value=f"**{queue.current['title']}**",
-            inline=False
-        )
-    
+        embed.add_field(name="🎶 Currently Playing", value=f"**{queue.current['title']}**", inline=False)
     if not queue.is_empty():
         queue_text = ""
         for i, track in enumerate(queue.queue[:10], 1):
             queue_text += f"`{i}.` {track['title']}\n"
-        
         if queue_text:
-            embed.add_field(
-                name=f"⏭️ Up Next ({len(queue.queue)} tracks)",
-                value=queue_text[:1024],
-                inline=False
-            )
-    
+            embed.add_field(name=f"⏭️ Up Next ({len(queue.queue)} tracks)", value=queue_text[:1024], inline=False)
     embed.set_footer(text=f"Queue size: {len(queue.queue)}")
     await ctx.send(embed=embed)
 
 @bot.command(name="loop")
 async def loop(ctx):
-    """Toggle loop for the current song"""
     guild_id = ctx.guild.id
-    
     if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
-    
     queue = music_queues[guild_id]
     queue.loop = not queue.loop
-    
-    if queue.loop:
-        await ctx.send("🔁 Loop enabled! Current song will repeat.")
-    else:
-        await ctx.send("🔁 Loop disabled!")
+    await ctx.send("🔁 Loop enabled!" if queue.loop else "🔁 Loop disabled!")
 
 @bot.command(name="nowplaying", aliases=["np"])
 async def now_playing(ctx):
-    """Show the currently playing song"""
     guild_id = ctx.guild.id
-    
     if guild_id not in music_queues:
         await ctx.send("❌ Nothing is playing!")
         return
-    
     queue = music_queues[guild_id]
-    
     if not queue.current or not queue.is_playing:
         await ctx.send("❌ Nothing is playing!")
         return
-    
     track = queue.current
-    
-    embed = discord.Embed(
-        title="🎵 Now Playing",
-        description=f"**[{track['title']}]({track.get('url', '')})**",
-        color=discord.Color.blue()
-    )
-    
+    embed = discord.Embed(title="🎵 Now Playing", description=f"**{track['title']}**", color=discord.Color.blue())
     if track.get('thumbnail'):
         embed.set_thumbnail(url=track['thumbnail'])
-    
     if track.get('duration'):
         minutes = track['duration'] // 60
         seconds = track['duration'] % 60
         embed.add_field(name="⏱️ Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-    
     if track.get('uploader'):
         embed.add_field(name="👤 Uploader", value=track['uploader'], inline=True)
-    
     if track.get('requester'):
         embed.add_field(name="📝 Requested By", value=track['requester'], inline=True)
-    
     if queue.loop:
         embed.add_field(name="🔁 Loop", value="Enabled", inline=True)
-    
     await ctx.send(embed=embed)
 
 @bot.command(name="clearqueue", aliases=["cq"])
 async def clear_queue(ctx):
-    """Clear the music queue"""
     guild_id = ctx.guild.id
-    
     if guild_id in music_queues:
-        queue = music_queues[guild_id]
-        queue.clear()
+        music_queues[guild_id].clear()
         await ctx.send("🗑️ Queue cleared!")
     else:
         await ctx.send("📭 Queue is already empty!")
 
 @bot.command(name="remove")
 async def remove_from_queue(ctx, position: int):
-    """Remove a song from the queue by position"""
     guild_id = ctx.guild.id
-    
     if guild_id not in music_queues:
         await ctx.send("📭 Queue is empty!")
         return
-    
-    queue = music_queues[guild_id]
-    removed = queue.remove(position - 1)
-    
+    removed = music_queues[guild_id].remove(position - 1)
     if removed:
         await ctx.send(f"✅ Removed: **{removed['title']}**")
     else:
@@ -589,31 +548,24 @@ async def remove_from_queue(ctx, position: int):
 
 @bot.command(name="shuffle")
 async def shuffle_queue(ctx):
-    """Shuffle the music queue"""
     import random
     guild_id = ctx.guild.id
-    
     if guild_id not in music_queues:
         await ctx.send("📭 Queue is empty!")
         return
-    
     queue = music_queues[guild_id]
     if len(queue.queue) < 2:
         await ctx.send("❌ Need at least 2 songs to shuffle!")
         return
-    
     random.shuffle(queue.queue)
     await ctx.send("🔀 Queue shuffled!")
 
 @bot.command(name="leave")
 async def leave(ctx):
-    """Make the bot leave the voice channel"""
     guild_id = ctx.guild.id
-    
     if guild_id in music_queues:
         music_queues[guild_id].clear()
         music_queues[guild_id].is_playing = False
-    
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
         await ctx.send("👋 Left the voice channel!")
@@ -623,66 +575,41 @@ async def leave(ctx):
 # ==================== AFK FUNCTIONS ====================
 
 async def move_to_afk(member, afk_channel):
-    """Move a member to the AFK channel and mute/deafen them"""
     try:
         await member.move_to(afk_channel)
         await asyncio.sleep(0.5)
         await member.edit(mute=True, deafen=True)
-        print(f"🔇 Moved {member.name} to AFK")
-        try:
-            await member.send(f"You were moved to {afk_channel.name} due to inactivity.")
-        except:
-            pass
+        logger.info(f"Moved {member.name} to AFK")
     except Exception as e:
-        print(f"❌ Error moving {member.name}: {e}")
+        logger.error(f"Error moving {member.name}: {e}")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Track voice state changes for AFK management"""
-    if member.bot:
-        return
-    
-    if not AFK_CHANNEL_ID:
+    if member.bot or not AFK_CHANNEL_ID:
         return
     
     if after.channel and not before.channel:
-        voice_activity[member.id] = {
-            "channel_id": after.channel.id,
-            "last_active": datetime.now()
-        }
+        voice_activity[member.id] = {"channel_id": after.channel.id, "last_active": datetime.now()}
     elif not after.channel and before.channel:
-        if member.id in voice_activity:
-            del voice_activity[member.id]
+        voice_activity.pop(member.id, None)
     elif after.channel and before.channel and after.channel.id != before.channel.id:
         if after.channel.id == AFK_CHANNEL_ID:
             await move_to_afk(member, after.channel)
             return
-        voice_activity[member.id] = {
-            "channel_id": after.channel.id,
-            "last_active": datetime.now()
-        }
+        voice_activity[member.id] = {"channel_id": after.channel.id, "last_active": datetime.now()}
     
     if after.channel and after.channel.id != AFK_CHANNEL_ID:
         asyncio.create_task(check_afk(member))
 
 async def check_afk(member):
-    """Check if a member has been inactive for too long"""
     if not AFK_CHANNEL_ID:
         return
-    
     await asyncio.sleep(AFK_TIMEOUT_MINUTES * 60)
-    
-    if not member.voice or not member.voice.channel:
+    if not member.voice or not member.voice.channel or member.voice.channel.id == AFK_CHANNEL_ID:
         return
-    
-    if member.voice.channel.id == AFK_CHANNEL_ID:
-        return
-    
     if member.id in voice_activity:
         last_active = voice_activity[member.id]["last_active"]
-        time_since_active = (datetime.now() - last_active).total_seconds()
-        
-        if time_since_active >= AFK_TIMEOUT_MINUTES * 60:
+        if (datetime.now() - last_active).total_seconds() >= AFK_TIMEOUT_MINUTES * 60:
             afk_channel = member.guild.get_channel(AFK_CHANNEL_ID)
             if afk_channel:
                 await move_to_afk(member, afk_channel)
@@ -690,98 +617,44 @@ async def check_afk(member):
 # ==================== PRESENCE FUNCTIONS ====================
 
 async def update_member_presence(member):
-    """Update member presence to your API"""
     try:
-        status_map = {
-            discord.Status.online: "online",
-            discord.Status.idle: "idle",
-            discord.Status.dnd: "dnd",
-            discord.Status.offline: "offline"
-        }
+        status_map = {discord.Status.online: "online", discord.Status.idle: "idle", 
+                      discord.Status.dnd: "dnd", discord.Status.offline: "offline"}
         status = status_map.get(member.status, "offline")
-        
         activities = []
-        custom_status = None
-        
         for activity in member.activities:
-            if activity.type == discord.ActivityType.custom:
-                custom_status = {
-                    "state": activity.state,
-                    "emoji": str(activity.emoji) if activity.emoji else None
-                }
-            elif activity.type == discord.ActivityType.playing:
-                activities.append({
-                    "type": "game",
-                    "name": activity.name,
-                    "details": getattr(activity, "details", None),
-                    "state": getattr(activity, "state", None)
-                })
+            if activity.type == discord.ActivityType.playing:
+                activities.append({"type": "game", "name": activity.name})
             elif activity.type == discord.ActivityType.listening:
                 if activity.name == "Spotify":
-                    activities.append({
-                        "type": "spotify",
-                        "song": getattr(activity, "title", "Unknown"),
-                        "artist": getattr(activity, "artist", "Unknown"),
-                        "album": getattr(activity, "album", "Unknown"),
-                        "album_art": getattr(activity, "album_cover_url", None)
-                    })
-                else:
-                    activities.append({
-                        "type": "listening",
-                        "name": activity.name
-                    })
-            elif activity.type == discord.ActivityType.watching:
-                activities.append({
-                    "type": "watching",
-                    "name": activity.name
-                })
-            elif activity.type == discord.ActivityType.streaming:
-                activities.append({
-                    "type": "streaming",
-                    "name": activity.name,
-                    "url": getattr(activity, "url", None)
-                })
-        
-        payload = {
-            "discord_id": str(member.id),
-            "username": member.name,
-            "global_name": member.global_name,
-            "avatar": str(member.avatar.url) if member.avatar else None,
-            "status": status,
-            "custom_status": custom_status,
-            "activities": activities,
-            "last_updated": datetime.now().isoformat()
-        }
-        
-        if activities or custom_status or status != "offline":
+                    activities.append({"type": "spotify", "song": getattr(activity, "title", "Unknown"),
+                                     "artist": getattr(activity, "artist", "Unknown")})
+        if activities:
+            payload = {"discord_id": str(member.id), "username": member.name, 
+                      "status": status, "activities": activities, 
+                      "last_updated": datetime.now().isoformat()}
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
                 async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
                     if resp.status == 200:
-                        print(f"✅ Updated {member.name}: {status}")
+                        logger.info(f"Updated {member.name}: {status}")
     except Exception as e:
-        print(f"❌ Error updating {member.name}: {e}")
+        logger.error(f"Error updating {member.name}: {e}")
 
 # ==================== BOT EVENTS ====================
 
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} is online!")
-    print(f"📊 Bot ID: {bot.user.id}")
-    print(f"🎵 Music Bot Ready!")
-    
+    logger.info(f"✅ {bot.user} is online!")
+    logger.info(f"📊 Bot ID: {bot.user.id}")
     guild = bot.get_guild(GUILD_ID)
     if guild:
-        print(f"📋 Connected to server: {guild.name}")
-        print(f"👥 Members: {len(guild.members)}")
-        
+        logger.info(f"📋 Connected to server: {guild.name}")
+        logger.info(f"👥 Members: {len(guild.members)}")
         for member in guild.members:
             if not member.bot:
                 await update_member_presence(member)
-        
-        print("✅ Initial sync complete!")
-    else:
-        print(f"❌ Could not find server with ID {GUILD_ID}")
+        logger.info("✅ Initial sync complete!")
 
 @bot.event
 async def on_presence_update(before, after):
@@ -792,52 +665,26 @@ async def on_presence_update(before, after):
 
 @bot.command(name="ping")
 async def ping(ctx):
-    """Check bot latency"""
     latency = round(bot.latency * 1000)
-    embed = discord.Embed(
-        title="🏓 Pong!",
-        description=f"Latency: {latency}ms",
-        color=discord.Color.green()
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
 @bot.command(name="stats")
 async def stats(ctx):
-    """Show bot statistics"""
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         await ctx.send("❌ Not connected to server")
         return
-    
-    total_members = len([m for m in guild.members if not m.bot])
+    total = len([m for m in guild.members if not m.bot])
     online = len([m for m in guild.members if m.status != discord.Status.offline and not m.bot])
-    voice_members = len([m for m in guild.members if m.voice and m.voice.channel])
-    
-    embed = discord.Embed(
-        title="📊 Bot Statistics",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="👥 Tracked Members", value=str(total_members), inline=True)
+    embed = discord.Embed(title="📊 Bot Statistics", color=discord.Color.blue())
+    embed.add_field(name="👥 Tracked Members", value=str(total), inline=True)
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
-    embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
-    
-    total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
-    embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
-    embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
-    
-    embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
 
 @bot.command(name="help")
 async def help_command(ctx):
-    """Show all commands"""
-    embed = discord.Embed(
-        title="🎵 Music Bot Commands",
-        description="Here are all available commands:",
-        color=discord.Color.blue()
-    )
-    
-    music_commands = {
+    embed = discord.Embed(title="🎵 Music Bot Commands", color=discord.Color.blue())
+    commands_list = {
         "!play / !p": "Play a song from YouTube or Spotify",
         "!skip": "Skip the current song",
         "!stop": "Stop playback and clear queue",
@@ -849,49 +696,27 @@ async def help_command(ctx):
         "!clearqueue / !cq": "Clear the music queue",
         "!remove": "Remove a song from queue by position",
         "!shuffle": "Shuffle the music queue",
-        "!leave": "Bot leaves the voice channel"
-    }
-    
-    music_text = ""
-    for cmd, desc in music_commands.items():
-        music_text += f"**{cmd}** - {desc}\n"
-    
-    embed.add_field(name="🎵 Music Commands", value=music_text, inline=False)
-    
-    utility = {
+        "!leave": "Bot leaves the voice channel",
         "!ping": "Check bot latency",
-        "!stats": "Show bot statistics",
-        "!help": "Show this help message"
+        "!stats": "Show bot statistics"
     }
-    
-    utility_text = ""
-    for cmd, desc in utility.items():
-        utility_text += f"**{cmd}** - {desc}\n"
-    
-    embed.add_field(name="ℹ️ Utility Commands", value=utility_text, inline=False)
-    
-    embed.set_footer(text="🎶 Enjoy the music!")
+    text = ""
+    for cmd, desc in commands_list.items():
+        text += f"**{cmd}** - {desc}\n"
+    embed.add_field(name="📋 Commands", value=text, inline=False)
     await ctx.send(embed=embed)
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
-    elif isinstance(error, commands.MissingPermissions):
-        await ctx.send(f"❌ You don't have permission to use this command!")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"❌ Invalid argument: {error}")
-    else:
-        print(f"❌ Command error: {error}")
-        await ctx.send(f"❌ An error occurred: {str(error)}")
+    logger.error(f"Command error: {error}")
+    await ctx.send(f"❌ Error: {str(error)}")
 
-# ==================== RUN THE BOT ====================
+# ==================== RUN ====================
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ ERROR: DISCORD_BOT_TOKEN not set!")
         exit(1)
-    if GUILD_ID == 0:
-        print("⚠️ WARNING: GUILD_ID not set! Some features may not work.")
-    
     print("🚀 Starting bot...")
     bot.run(TOKEN, reconnect=True)
