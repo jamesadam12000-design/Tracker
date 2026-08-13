@@ -33,6 +33,12 @@ LAVALINK_PORT = int(os.environ.get('LAVALINK_PORT', '8080'))
 LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
 LAVALINK_URL = f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
 
+logger.info("=" * 50)
+logger.info("🚀 BOT CONFIGURATION")
+logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
+logger.info(f"🔑 Lavalink Password: {LAVALINK_PASSWORD}")
+logger.info("=" * 50)
+
 # ==================== YT-DLP OPTIONS ====================
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
@@ -113,26 +119,32 @@ async def lavalink_request(endpoint, method='GET', data=None):
     
     url = f"{LAVALINK_URL}/{endpoint}"
     
+    logger.info(f"📡 Lavalink Request: {method} {url}")
+    
     async with aiohttp.ClientSession() as session:
         try:
             if method == 'GET':
                 async with session.get(url, headers=headers) as resp:
+                    logger.info(f"📡 Response: {resp.status}")
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 401:
-                        logger.error(f"❌ Lavalink 401 - Wrong password: {LAVALINK_PASSWORD}")
+                        logger.error(f"❌ Lavalink 401 - Wrong password!")
                         return None
                     else:
                         logger.error(f"❌ Lavalink error: {resp.status}")
                         return None
             elif method == 'POST':
                 async with session.post(url, headers=headers, json=data) as resp:
+                    logger.info(f"📡 Response: {resp.status}")
                     return resp.status == 200
             elif method == 'PATCH':
                 async with session.patch(url, headers=headers, json=data) as resp:
+                    logger.info(f"📡 Response: {resp.status}")
                     return resp.status == 200
             elif method == 'DELETE':
                 async with session.delete(url, headers=headers) as resp:
+                    logger.info(f"📡 Response: {resp.status}")
                     return resp.status == 200
         except Exception as e:
             logger.error(f"❌ Lavalink request error: {e}")
@@ -154,7 +166,9 @@ async def lavalink_create_session():
             lavalink_connected = True
             logger.info(f"✅ Lavalink session created: {lavalink_session_id}")
             return True
-        return False
+        else:
+            logger.error(f"❌ Failed to create session: {result}")
+            return False
     except Exception as e:
         logger.error(f"❌ Failed to create Lavalink session: {e}")
         return False
@@ -177,6 +191,8 @@ async def lavalink_connect_voice(guild_id, channel_id):
             'PATCH',
             voice_data
         )
+        if result:
+            logger.info(f"✅ Connected to voice channel via Lavalink")
         return result
     except Exception as e:
         logger.error(f"❌ Lavalink connect voice error: {e}")
@@ -191,12 +207,14 @@ async def lavalink_play_track(guild_id, track_identifier):
         # First, load the track
         load_result = await lavalink_request(f"loadtracks?identifier={track_identifier}")
         if not load_result or 'tracks' not in load_result or not load_result['tracks']:
+            logger.error(f"❌ No tracks found for: {track_identifier}")
             return False
         
         track = load_result['tracks'][0]
         track_id = track.get('track')
         
         if not track_id:
+            logger.error("❌ No track ID found")
             return False
         
         # Play the track
@@ -209,6 +227,8 @@ async def lavalink_play_track(guild_id, track_identifier):
             'POST',
             play_data
         )
+        if result:
+            logger.info(f"✅ Playing track via Lavalink")
         return result
     except Exception as e:
         logger.error(f"❌ Lavalink play error: {e}")
@@ -255,6 +275,8 @@ async def lavalink_leave_voice(guild_id):
             f"sessions/{lavalink_session_id}/players/{guild_id}",
             'DELETE'
         )
+        if result:
+            logger.info(f"✅ Left voice channel via Lavalink")
         return result
     except Exception as e:
         logger.error(f"❌ Lavalink leave error: {e}")
@@ -424,7 +446,7 @@ async def play(ctx, *, query):
         return
     
     if not lavalink_connected:
-        await ctx.send("❌ Bot is not connected to Lavalink. Please wait or check configuration.")
+        await ctx.send("❌ Bot is not connected to Lavalink. Check !lavalink status.")
         return
     
     voice_channel = ctx.author.voice.channel
@@ -678,7 +700,7 @@ async def check_afk(member):
             if afk_channel:
                 await move_to_afk(member, afk_channel)
 
-# ==================== PRESENCE FUNCTIONS - CONTINUOUS TRACKING ====================
+# ==================== PRESENCE FUNCTIONS ====================
 
 async def update_member_presence(member):
     """Update member presence to your API"""
@@ -767,7 +789,6 @@ async def sync_members():
             except Exception as e:
                 logger.error(f"❌ Error syncing {member.name}: {e}")
         
-        # Add small delay to avoid rate limits
         await asyncio.sleep(0.1)
     
     logger.info("✅ Sync complete!")
@@ -784,6 +805,7 @@ async def on_ready():
     logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
     
     # Connect to Lavalink
+    logger.info("🔄 Connecting to Lavalink...")
     if await lavalink_create_session():
         logger.info("✅ Lavalink connected successfully!")
     else:
@@ -799,7 +821,7 @@ async def on_ready():
         for member in guild.members:
             if not member.bot:
                 await update_member_presence(member)
-                await asyncio.sleep(0.1)  # Rate limit prevention
+                await asyncio.sleep(0.1)
         
         logger.info("✅ Initial sync complete!")
         
@@ -820,7 +842,6 @@ async def on_presence_update(before, after):
 async def on_member_update(before, after):
     """Triggered when a member's anything updates"""
     if not after.bot:
-        # Check if presence changed
         if before.status != after.status or before.activities != after.activities:
             logger.info(f"🔄 Member update for {after.name}")
             await update_member_presence(after)
@@ -850,15 +871,11 @@ async def stats(ctx):
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
     
-    # Music stats
     total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
     
-    # Lavalink status
     embed.add_field(name="🎧 Lavalink", value="✅ Connected" if lavalink_connected else "❌ Disconnected", inline=True)
-    
-    # Sync status
     embed.add_field(name="🔄 Auto Sync", value="✅ Every 5 minutes", inline=True)
     embed.add_field(name="📡 Real-time Updates", value="✅ Enabled", inline=True)
     
@@ -892,7 +909,7 @@ async def check_lavalink(ctx):
             color=discord.Color.red()
         )
         embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
-        embed.add_field(name="Password", value="✅ Set" if LAVALINK_PASSWORD else "❌ Not set", inline=False)
+        embed.add_field(name="Troubleshooting", value="Check if Lavalink is running on Railway", inline=False)
         await ctx.send(embed=embed)
 
 @bot.command(name="help")
@@ -929,11 +946,6 @@ async def help_command(ctx):
         text += f"**{cmd}** - {desc}\n"
     
     embed.add_field(name="📋 Commands", value=text, inline=False)
-    embed.add_field(
-        name="📡 Member Tracking",
-        value="• Real-time presence updates\n• Auto-sync every 5 minutes\n• Manual sync with !syncnow",
-        inline=False
-    )
     embed.set_footer(text="🎶 Enjoy the music! | Auto-sync every 5 minutes")
     await ctx.send(embed=embed)
 
@@ -957,8 +969,10 @@ if __name__ == "__main__":
     if GUILD_ID == 0:
         print("⚠️ WARNING: GUILD_ID not set! Some features may not work.")
     
-    print(f"🚀 Starting bot...")
+    print("=" * 50)
+    print("🚀 Starting bot...")
     print(f"🎧 Lavalink URL: {LAVALINK_URL}")
     print(f"📡 Member tracking: Enabled (auto-sync every 5 minutes)")
     print(f"🎙️ AFK management: {'Enabled' if AFK_CHANNEL_ID else 'Disabled'}")
+    print("=" * 50)
     bot.run(TOKEN, reconnect=True)
