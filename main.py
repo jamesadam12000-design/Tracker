@@ -16,10 +16,13 @@ def patch_voice_client():
         from discord.voice_client import VoiceClient
         import discord.gateway
         
+        # Store original connect method
         original_connect = VoiceClient.connect
         
-        async def patched_connect(self, *, timeout=None, reconnect=True):
+        async def patched_connect(self, *args, **kwargs):
+            """Patched connect that handles 4017 error - accepts any arguments"""
             try:
+                # Clean up any existing connection
                 if hasattr(self, 'ws') and self.ws:
                     try:
                         await self.ws.close()
@@ -27,12 +30,14 @@ def patch_voice_client():
                         pass
                     self.ws = None
                 
-                return await original_connect(self, timeout=timeout, reconnect=reconnect)
+                # Try to connect
+                return await original_connect(self, *args, **kwargs)
                 
             except discord.errors.ConnectionClosed as e:
                 if e.code in (4006, 4017):
                     logging.warning(f"Voice connection closed with {e.code}, retrying...")
                     
+                    # Clean up
                     if hasattr(self, 'ws') and self.ws:
                         try:
                             await self.ws.close()
@@ -40,11 +45,13 @@ def patch_voice_client():
                             pass
                         self.ws = None
                     
+                    # Wait and retry
                     await asyncio.sleep(2)
-                    return await original_connect(self, timeout=timeout or 30.0, reconnect=reconnect)
+                    return await original_connect(self, *args, **kwargs)
                 else:
                     raise
         
+        # Apply the patch
         VoiceClient.connect = patched_connect
         logging.info("✅ Applied 4017 voice fix")
         return True
@@ -53,6 +60,7 @@ def patch_voice_client():
         logging.error(f"❌ Failed to patch voice client: {e}")
         return False
 
+# Apply the patch
 patch_voice_client()
 
 # ==================== LOGGING ====================
@@ -69,10 +77,10 @@ AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '1537088478687531168'))
 AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))
 
 # Spotify API
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
+SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
-# ==================== FIXED YT-DLP OPTIONS ====================
+# ==================== YT-DLP OPTIONS ====================
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -loglevel quiet',
     'options': '-vn -loglevel quiet'
@@ -153,95 +161,66 @@ class MusicQueue:
 # ==================== VOICE CONNECTION ====================
 
 async def connect_voice(ctx):
-    """Connect to voice channel with the patched voice client"""
+    """Connect to voice channel with proper error handling"""
     if not ctx.author.voice:
         return None, "❌ You need to be in a voice channel!"
     
     voice_channel = ctx.author.voice.channel
     
+    # Check if already connected to the same channel
     if ctx.voice_client:
         if ctx.voice_client.channel == voice_channel:
             return ctx.voice_client, None
+        # Disconnect from current channel first
         try:
             await ctx.voice_client.disconnect()
             await asyncio.sleep(1)
         except:
             pass
     
-    for attempt in range(3):
-        try:
-            voice_client = await voice_channel.connect(timeout=30.0, reconnect=True)
-            await asyncio.sleep(2)
-            if voice_client and voice_client.is_connected():
-                logger.info(f"✅ Connected to {voice_channel.name}")
-                return voice_client, None
-        except discord.errors.ConnectionClosed as e:
-            if e.code in (4006, 4017):
-                logger.warning(f"Connection error {e.code} on attempt {attempt + 1}, retrying...")
-                if ctx.voice_client:
-                    try:
-                        await ctx.voice_client.disconnect()
-                    except:
-                        pass
-                await asyncio.sleep(3)
-                continue
-            return None, f"❌ Voice error: {str(e)}"
-        except Exception as e:
-            logger.error(f"Connection attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
+    # Try to connect
+    try:
+        voice_client = await voice_channel.connect(timeout=30.0, reconnect=True)
+        await asyncio.sleep(2)
+        if voice_client and voice_client.is_connected():
+            logger.info(f"✅ Connected to {voice_channel.name}")
+            return voice_client, None
+    except discord.errors.ConnectionClosed as e:
+        if e.code in (4006, 4017):
+            logger.warning(f"Connection error {e.code}, retrying...")
+            if ctx.voice_client:
+                try:
+                    await ctx.voice_client.disconnect()
+                except:
+                    pass
+            await asyncio.sleep(3)
+            try:
+                voice_client = await voice_channel.connect(timeout=30.0, reconnect=True)
                 await asyncio.sleep(2)
-                continue
-            return None, f"❌ Failed to connect: {str(e)}"
+                if voice_client and voice_client.is_connected():
+                    logger.info(f"✅ Connected to {voice_channel.name} (retry)")
+                    return voice_client, None
+            except Exception as e2:
+                return None, f"❌ Voice error after retry: {str(e2)}"
+        return None, f"❌ Voice error: {str(e)}"
+    except Exception as e:
+        return None, f"❌ Failed to connect: {str(e)}"
     
-    return None, "❌ Could not connect to voice channel after multiple attempts"
+    return None, "❌ Could not connect to voice channel"
 
-# ==================== FIXED SEARCH FUNCTIONS ====================
+# ==================== SEARCH FUNCTIONS ====================
 
 async def search_youtube(query, requester):
-    """Search YouTube for tracks - FIXED for 'Please sign in' error"""
+    """Search YouTube for tracks - handles sign-in errors"""
     try:
         youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
         
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             if re.match(youtube_regex, query):
-                # Direct URL - try without search
-                try:
-                    info = ydl.extract_info(query, download=False)
-                except Exception as e:
-                    if "Sign in" in str(e) or "sign in" in str(e):
-                        logger.warning(f"Sign-in error, trying alternative method...")
-                        # Try using a different extractor
-                        YDL_OPTIONS_ALT = YDL_OPTIONS.copy()
-                        YDL_OPTIONS_ALT['extractor_args'] = {
-                            'youtube': {
-                                'player_client': ['android'],
-                                'skip': ['dash', 'hls'],
-                            }
-                        }
-                        with yt_dlp.YoutubeDL(YDL_OPTIONS_ALT) as ydl2:
-                            info = ydl2.extract_info(query, download=False)
-                    else:
-                        raise
+                info = ydl.extract_info(query, download=False)
             else:
-                # Search query
                 search_query = f"ytsearch3:{query}"
-                try:
-                    info = ydl.extract_info(search_query, download=False)
-                except Exception as e:
-                    if "Sign in" in str(e) or "sign in" in str(e):
-                        logger.warning(f"Sign-in error on search, using fallback...")
-                        # Try with different client
-                        YDL_OPTIONS_ALT = YDL_OPTIONS.copy()
-                        YDL_OPTIONS_ALT['extractor_args'] = {
-                            'youtube': {
-                                'player_client': ['android'],
-                                'skip': ['dash', 'hls'],
-                            }
-                        }
-                        with yt_dlp.YoutubeDL(YDL_OPTIONS_ALT) as ydl2:
-                            info = ydl2.extract_info(search_query, download=False)
-                    else:
-                        raise
+                info = ydl.extract_info(search_query, download=False)
             
             if not info:
                 return []
@@ -273,6 +252,36 @@ async def search_youtube(query, requester):
             return tracks
     except Exception as e:
         logger.error(f"YouTube search error: {e}")
+        # Try alternative method if sign-in error
+        if "Sign in" in str(e):
+            logger.info("Attempting alternative YouTube search method...")
+            try:
+                alt_options = YDL_OPTIONS.copy()
+                alt_options['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['dash', 'hls'],
+                    }
+                }
+                with yt_dlp.YoutubeDL(alt_options) as ydl:
+                    search_query = f"ytsearch3:{query}"
+                    info = ydl.extract_info(search_query, download=False)
+                    if info and 'entries' in info:
+                        tracks = []
+                        for entry in info['entries']:
+                            if entry:
+                                tracks.append({
+                                    'title': entry.get('title', 'Unknown'),
+                                    'url': entry.get('webpage_url', entry.get('url')),
+                                    'duration': entry.get('duration', 0),
+                                    'thumbnail': entry.get('thumbnail', ''),
+                                    'uploader': entry.get('uploader', 'Unknown'),
+                                    'requester': requester,
+                                    'source': 'youtube'
+                                })
+                        return tracks
+            except:
+                pass
         return []
 
 async def search_spotify(query, requester):
@@ -330,34 +339,34 @@ async def search_spotify(query, requester):
         return []
 
 async def get_audio_url(url):
-    """Get direct audio URL from YouTube - FIXED for sign-in error"""
+    """Get direct audio URL from YouTube"""
     try:
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                if info and 'url' in info:
-                    return info['url']
-                return None
-            except Exception as e:
-                if "Sign in" in str(e) or "sign in" in str(e):
-                    logger.warning(f"Sign-in error, using alternative method...")
-                    YDL_OPTIONS_ALT = YDL_OPTIONS.copy()
-                    YDL_OPTIONS_ALT['extractor_args'] = {
-                        'youtube': {
-                            'player_client': ['android'],
-                            'skip': ['dash', 'hls'],
-                        }
-                    }
-                    with yt_dlp.YoutubeDL(YDL_OPTIONS_ALT) as ydl2:
-                        info = ydl2.extract_info(url, download=False)
-                        if info and 'url' in info:
-                            return info['url']
-                return None
+            info = ydl.extract_info(url, download=False)
+            if info and 'url' in info:
+                return info['url']
+            return None
     except Exception as e:
         logger.error(f"Error getting audio: {e}")
+        # Try alternative method if sign-in error
+        if "Sign in" in str(e):
+            try:
+                alt_options = YDL_OPTIONS.copy()
+                alt_options['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['dash', 'hls'],
+                    }
+                }
+                with yt_dlp.YoutubeDL(alt_options) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info and 'url' in info:
+                        return info['url']
+            except:
+                pass
         return None
 
-# ==================== REST OF BOT CODE ====================
+# ==================== MUSIC COMMANDS ====================
 
 async def play_next(ctx, guild_id):
     """Play the next song in queue"""
@@ -426,8 +435,6 @@ async def play_next(ctx, guild_id):
         queue.is_playing = False
         await play_next(ctx, guild_id)
 
-# ==================== MUSIC COMMANDS ====================
-
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
     """Play a song from YouTube or Spotify"""
@@ -456,12 +463,8 @@ async def play(ctx, *, query):
     else:
         tracks = await search_youtube(query, ctx.author.mention)
         if not tracks:
-            # Try again with a different approach
-            await ctx.send("⚠️ First attempt failed, trying alternative method...")
-            tracks = await search_youtube(query, ctx.author.mention)
-            if not tracks:
-                await ctx.send("❌ No results found! Please try a different song.")
-                return
+            await ctx.send("❌ No results found! Please try a different song.")
+            return
     
     for track in tracks:
         track['channel_id'] = ctx.channel.id
