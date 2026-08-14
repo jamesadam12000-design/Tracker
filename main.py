@@ -27,10 +27,28 @@ SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
 # ==================== LAVALINK ====================
+# FIX: Railway's public *.up.railway.app domain only accepts standard
+# HTTPS traffic at the edge - you can't hit it directly on a custom
+# port like 8080. If you're using Railway's public domain, connect over
+# HTTPS with NO port. If you're using a Railway TCP Proxy, set
+# LAVALINK_PORT to the *proxy* port Railway assigned you (Settings ->
+# Networking -> TCP Proxy on the Lavalink service), not Lavalink's
+# internal listening port.
 LAVALINK_HOST = os.environ.get('LAVALINK_HOST', 'lavalink-production-ddf1.up.railway.app')
-LAVALINK_PORT = int(os.environ.get('LAVALINK_PORT', '8080'))
+LAVALINK_PORT = os.environ.get('LAVALINK_PORT', '')  # leave empty if using the public domain
+LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() == 'true'
 LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
-LAVALINK_URL = f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
+
+_scheme = 'https' if LAVALINK_SSL else 'http'
+if LAVALINK_PORT:
+    LAVALINK_URL = f"{_scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}"
+else:
+    LAVALINK_URL = f"{_scheme}://{LAVALINK_HOST}"
+
+# FIX: no timeout was previously set on aiohttp requests, so a bad
+# host/port would hang for minutes before failing. Cap it so startup
+# fails fast and retries actually happen on schedule.
+LAVALINK_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 logger.info("=" * 50)
 logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
@@ -84,10 +102,10 @@ class MusicQueue:
         self.current = None
         self.is_playing = False
         self.loop = False
-    
+
     def add(self, track):
         self.queue.append(track)
-    
+
     def next(self):
         if self.queue:
             self.current = self.queue.pop(0)
@@ -95,15 +113,15 @@ class MusicQueue:
         self.current = None
         self.is_playing = False
         return None
-    
+
     def clear(self):
         self.queue.clear()
         self.current = None
         self.is_playing = False
-    
+
     def size(self):
         return len(self.queue)
-    
+
     def is_empty(self):
         return len(self.queue) == 0
 
@@ -117,25 +135,44 @@ async def lavalink_request(endpoint, method='GET', data=None):
         'Accept': 'application/json'
     }
     url = f"{LAVALINK_URL}/{endpoint}"
-    
-    async with aiohttp.ClientSession() as session:
+
+    # FIX: timeout added so a bad host/port fails in ~10s instead of hanging
+    async with aiohttp.ClientSession(timeout=LAVALINK_TIMEOUT) as session:
         try:
             if method == 'GET':
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         return await resp.json()
+                    logger.error(f"❌ Lavalink GET {endpoint} -> HTTP {resp.status}")
                     return None
             elif method == 'POST':
                 async with session.post(url, headers=headers, json=data) as resp:
-                    return resp.status == 200
+                    if resp.status not in (200, 204):
+                        body = await resp.text()
+                        logger.error(f"❌ Lavalink POST {endpoint} -> HTTP {resp.status}: {body[:300]}")
+                        return False
+                    # Some POST endpoints (e.g. session creation) return a JSON body
+                    if resp.content_type == 'application/json':
+                        try:
+                            return await resp.json()
+                        except Exception:
+                            return True
+                    return True
             elif method == 'PATCH':
                 async with session.patch(url, headers=headers, json=data) as resp:
-                    return resp.status == 200
+                    if resp.status not in (200, 204):
+                        body = await resp.text()
+                        logger.error(f"❌ Lavalink PATCH {endpoint} -> HTTP {resp.status}: {body[:300]}")
+                        return False
+                    return True
             elif method == 'DELETE':
                 async with session.delete(url, headers=headers) as resp:
-                    return resp.status == 200
-        except aiohttp.ClientConnectorError:
-            logger.error(f"❌ Cannot connect to Lavalink at {LAVALINK_URL}")
+                    return resp.status in (200, 204)
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"❌ Cannot connect to Lavalink at {LAVALINK_URL}: {e}")
+            return None
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Lavalink request timed out: {url}")
             return None
         except Exception as e:
             logger.error(f"❌ Lavalink error: {e}")
@@ -144,7 +181,7 @@ async def lavalink_request(endpoint, method='GET', data=None):
 async def lavalink_init():
     """Create a Lavalink session with retries"""
     global lavalink_session_id, lavalink_connected, lavalink_retry_count
-    
+
     try:
         # Check if Lavalink is reachable
         version = await lavalink_request("version")
@@ -153,23 +190,32 @@ async def lavalink_init():
         else:
             logger.warning("⚠️ Cannot get Lavalink version")
             return False
-        
+
         # Create session
-        result = await lavalink_request("sessions", 'POST', {
+        result = await lavalink_request("v4/sessions", 'POST', {
             "clientName": "DiscordBot",
             "resumingKey": "discord_bot",
             "resumingTimeout": 60
         })
-        
-        if result and 'sessionId' in result:
+
+        # FIX: fall back to the unversioned path in case the server is
+        # running an older Lavalink release that doesn't use /v4
+        if not (result and isinstance(result, dict) and 'sessionId' in result):
+            result = await lavalink_request("sessions", 'POST', {
+                "clientName": "DiscordBot",
+                "resumingKey": "discord_bot",
+                "resumingTimeout": 60
+            })
+
+        if result and isinstance(result, dict) and 'sessionId' in result:
             lavalink_session_id = result['sessionId']
             lavalink_connected = True
             logger.info(f"✅ Lavalink connected! Session: {lavalink_session_id}")
             return True
-        
+
         logger.error("❌ Failed to create Lavalink session")
         return False
-        
+
     except Exception as e:
         logger.error(f"❌ Lavalink init error: {e}")
         return False
@@ -179,39 +225,55 @@ async def lavalink_join(guild_id, channel_id):
         return False
     try:
         result = await lavalink_request(
+            f"v4/sessions/{lavalink_session_id}/players/{guild_id}",
+            'PATCH',
+            {"voice": {"token": None, "endpoint": None, "sessionId": lavalink_session_id}}
+        ) if False else await lavalink_request(
             f"sessions/{lavalink_session_id}/players/{guild_id}/voice",
             'PATCH',
             {"voice": {"sessionId": lavalink_session_id, "channelId": str(channel_id), "guildId": str(guild_id)}}
         )
         return result
-    except:
+    except Exception as e:
+        logger.error(f"❌ Lavalink join error: {e}")
         return False
 
 async def lavalink_play(guild_id, track_url):
     if not lavalink_session_id:
         return False
     try:
-        encoded = urllib.parse.quote(track_url)
+        encoded = urllib.parse.quote(track_url, safe='')
         load = await lavalink_request(f"loadtracks?identifier={encoded}")
         if not load or 'tracks' not in load or not load['tracks']:
+            logger.error(f"❌ No tracks loaded for: {track_url}")
             return False
-        track_id = load['tracks'][0].get('track')
+        track_id = load['tracks'][0].get('encoded') or load['tracks'][0].get('track')
         if not track_id:
             return False
         return await lavalink_request(
             f"sessions/{lavalink_session_id}/players/{guild_id}/play",
-            'POST',
-            {"track": track_id, "noReplace": False}
+            'PATCH',
+            {"track": {"encoded": track_id}}
+        ) if False else await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}",
+            'PATCH',
+            {"track": {"encoded": track_id}}
         )
-    except:
+    except Exception as e:
+        logger.error(f"❌ Lavalink play error: {e}")
         return False
 
 async def lavalink_stop(guild_id):
     if not lavalink_session_id:
         return False
     try:
-        return await lavalink_request(f"sessions/{lavalink_session_id}/players/{guild_id}/stop", 'POST')
-    except:
+        return await lavalink_request(
+            f"sessions/{lavalink_session_id}/players/{guild_id}",
+            'PATCH',
+            {"track": {"encoded": None}}
+        )
+    except Exception as e:
+        logger.error(f"❌ Lavalink stop error: {e}")
         return False
 
 async def lavalink_pause(guild_id, pause=True):
@@ -219,11 +281,12 @@ async def lavalink_pause(guild_id, pause=True):
         return False
     try:
         return await lavalink_request(
-            f"sessions/{lavalink_session_id}/players/{guild_id}/pause",
+            f"sessions/{lavalink_session_id}/players/{guild_id}",
             'PATCH',
             {"paused": pause}
         )
-    except:
+    except Exception as e:
+        logger.error(f"❌ Lavalink pause error: {e}")
         return False
 
 async def lavalink_leave(guild_id):
@@ -231,7 +294,8 @@ async def lavalink_leave(guild_id):
         return False
     try:
         return await lavalink_request(f"sessions/{lavalink_session_id}/players/{guild_id}", 'DELETE')
-    except:
+    except Exception as e:
+        logger.error(f"❌ Lavalink leave error: {e}")
         return False
 
 # ==================== SEARCH ====================
@@ -241,9 +305,9 @@ async def search_youtube(query, requester):
         youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             if re.match(youtube_regex, query):
-                info = ydl.extract_info(query, download=False)
+                info = await asyncio.to_thread(ydl.extract_info, query, False)
             else:
-                info = ydl.extract_info(f"ytsearch3:{query}", download=False)
+                info = await asyncio.to_thread(ydl.extract_info, f"ytsearch3:{query}", False)
             if not info:
                 return []
             tracks = []
@@ -286,7 +350,7 @@ async def search_spotify(query, requester):
         if "open.spotify.com" in query:
             if "playlist" in query:
                 playlist_id = query.split("playlist/")[1].split("?")[0]
-                results = sp.playlist_tracks(playlist_id)
+                results = await asyncio.to_thread(sp.playlist_tracks, playlist_id)
                 for item in results['items']:
                     track = item['track']
                     if track:
@@ -297,14 +361,14 @@ async def search_spotify(query, requester):
                             tracks.append(yt[0])
             elif "track" in query:
                 track_id = query.split("track/")[1].split("?")[0]
-                result = sp.track(track_id)
+                result = await asyncio.to_thread(sp.track, track_id)
                 yt = await search_youtube(f"{result['name']} {result['artists'][0]['name']}", requester)
                 if yt:
                     yt[0]['source'] = 'spotify'
                     yt[0]['spotify_artist'] = result['artists'][0]['name']
                     tracks.append(yt[0])
         else:
-            results = sp.search(q=query, type='track', limit=5)
+            results = await asyncio.to_thread(sp.search, q=query, type='track', limit=5)
             for item in results['tracks']['items']:
                 yt = await search_youtube(f"{item['name']} {item['artists'][0]['name']}", requester)
                 if yt:
@@ -503,18 +567,31 @@ async def check_lavalink(ctx):
         await ctx.send(embed=embed)
     else:
         embed = discord.Embed(
-            title="🎧 Lavalink", 
-            description="❌ Not connected!", 
+            title="🎧 Lavalink",
+            description="❌ Not connected!",
             color=discord.Color.red()
         )
         embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
-        embed.add_field(name="Troubleshooting", 
-            value="1. Check LAVALINK_HOST is correct\n"
-                  "2. Check LAVALINK_PASSWORD is correct\n"
-                  "3. Make sure Lavalink is running\n"
-                  "4. Check Railway logs for errors", 
+        embed.add_field(name="Troubleshooting",
+            value="1. Confirm LAVALINK_HOST is the Lavalink service's public domain\n"
+                  "2. Don't append a port if using Railway's public domain (use LAVALINK_PORT='' + LAVALINK_SSL=true)\n"
+                  "3. If using a TCP Proxy, LAVALINK_PORT must be the proxy port from Railway, not 8080\n"
+                  "4. Check LAVALINK_PASSWORD matches the Lavalink server's application.yml\n"
+                  "5. Check Railway logs for errors on the Lavalink service itself",
             inline=False)
         await ctx.send(embed=embed)
+
+@bot.command(name="reconnectlavalink")
+@commands.has_permissions(administrator=True)
+async def reconnect_lavalink(ctx):
+    """Manually retry the Lavalink connection (Admin only)"""
+    global lavalink_connected
+    await ctx.send("🔄 Reconnecting to Lavalink...")
+    ok = await lavalink_init()
+    if ok:
+        await ctx.send("✅ Reconnected!")
+    else:
+        await ctx.send("❌ Still failed. Check !lavalink for troubleshooting steps.")
 
 # ==================== AFK ====================
 
@@ -569,10 +646,14 @@ async def update_member_presence(member):
                 activities.append({"type": "spotify", "song": getattr(activity, "title", "Unknown")})
         if activities:
             payload = {"discord_id": str(member.id), "username": member.name, "status": status, "activities": activities, "last_updated": datetime.now().isoformat()}
-            async with aiohttp.ClientSession() as session:
+            # FIX: timeout added here too so a slow/unreachable API doesn't stall the sync loop
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
-                async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
-                    pass
+                try:
+                    async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
+                        pass
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.error(f"Presence API request failed: {e}")
     except Exception as e:
         logger.error(f"Presence error: {e}")
 
@@ -593,13 +674,13 @@ async def sync_members():
 @bot.event
 async def on_ready():
     global lavalink_connected
-    
+
     logger.info(f"✅ {bot.user} is online!")
     logger.info(f"📊 Bot ID: {bot.user.id}")
     logger.info(f"🎵 Music Bot Ready!")
     logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
-    
-    # Connect to Lavalink with retries
+
+    # Connect to Lavalink with retries (now fails fast per attempt thanks to the timeout)
     for attempt in range(5):
         logger.info(f"🔄 Connecting to Lavalink (attempt {attempt + 1}/5)...")
         if await lavalink_init():
@@ -608,10 +689,10 @@ async def on_ready():
         else:
             logger.warning(f"⚠️ Attempt {attempt + 1} failed, retrying in 5 seconds...")
             await asyncio.sleep(5)
-    
+
     if not lavalink_connected:
-        logger.error("❌ Failed to connect to Lavalink after 5 attempts!")
-    
+        logger.error("❌ Failed to connect to Lavalink after 5 attempts! Bot will still run, but music commands won't work until !reconnectlavalink succeeds.")
+
     guild = bot.get_guild(GUILD_ID)
     if guild:
         logger.info(f"📋 Connected to: {guild.name}")
@@ -657,7 +738,7 @@ async def sync_now(ctx):
 @bot.command(name="help")
 async def help_command(ctx):
     embed = discord.Embed(title="🎵 Music Bot Commands", color=discord.Color.blue())
-    commands = {
+    commands_list = {
         "!play / !p": "Play a song from YouTube or Spotify",
         "!skip": "Skip the current song",
         "!stop": "Stop playback and clear queue",
@@ -669,12 +750,13 @@ async def help_command(ctx):
         "!clearqueue / !cq": "Clear the music queue",
         "!leave": "Bot leaves the voice channel",
         "!lavalink": "Check Lavalink connection status",
+        "!reconnectlavalink": "Retry the Lavalink connection (Admin only)",
         "!ping": "Check bot latency",
         "!stats": "Show bot statistics",
         "!syncnow": "Force manual member sync (Admin only)"
     }
     text = ""
-    for cmd, desc in commands.items():
+    for cmd, desc in commands_list.items():
         text += f"**{cmd}** - {desc}\n"
     embed.add_field(name="📋 Commands", value=text, inline=False)
     embed.set_footer(text="🎶 Enjoy the music!")
