@@ -27,31 +27,73 @@ SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
 # ==================== LAVALINK ====================
-# FIX: Railway's public *.up.railway.app domain only accepts standard
-# HTTPS traffic at the edge - you can't hit it directly on a custom
-# port like 8080. If you're using Railway's public domain, connect over
-# HTTPS with NO port. If you're using a Railway TCP Proxy, set
-# LAVALINK_PORT to the *proxy* port Railway assigned you (Settings ->
-# Networking -> TCP Proxy on the Lavalink service), not Lavalink's
-# internal listening port.
-LAVALINK_HOST = os.environ.get('LAVALINK_HOST', 'lavalink-production-ddf1.up.railway.app')
-LAVALINK_PORT = os.environ.get('LAVALINK_PORT', '')  # leave empty if using the public domain
-LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() == 'true'
+# Railway networking has two totally different address forms and Lavalink
+# needs the RIGHT one:
+#
+#  A) PRIVATE/INTERNAL (works only if bot + Lavalink are services in the
+#     SAME Railway project) - fastest, no public exposure needed:
+#       host: <service-name>.railway.internal   (check Lavalink service's
+#             Settings -> Networking -> Private Networking)
+#       port: whatever Lavalink actually listens on internally (usually 8080)
+#       scheme: http  (private network traffic is not TLS)
+#
+#  B) PUBLIC DOMAIN (needed if they're in different projects, or you
+#     haven't enabled private networking):
+#       host: lavalink-production-ddf1.up.railway.app
+#       port: NONE - Railway's edge only terminates on 443/HTTPS
+#       scheme: https
+#
+# This code tries whichever candidates you give it via env vars, in order,
+# and uses the first one that actually answers /version. Set LAVALINK_HOST
+# to a comma-separated list to have it try more than one automatically.
+
 LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
 
-_scheme = 'https' if LAVALINK_SSL else 'http'
-if LAVALINK_PORT:
-    LAVALINK_URL = f"{_scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}"
-else:
-    LAVALINK_URL = f"{_scheme}://{LAVALINK_HOST}"
+def _build_candidates():
+    """
+    Build an ordered list of (url) candidates to try.
+    Reads LAVALINK_HOST (comma-separated allowed), LAVALINK_PORT,
+    LAVALINK_SSL as overrides. If LAVALINK_HOST is unset, falls back to a
+    sane default list covering both private and public addressing.
+    """
+    raw_host = os.environ.get('LAVALINK_HOST', '').strip()
+    raw_port = os.environ.get('LAVALINK_PORT', '').strip()
+    raw_ssl = os.environ.get('LAVALINK_SSL', '').strip().lower()
 
-# FIX: no timeout was previously set on aiohttp requests, so a bad
-# host/port would hang for minutes before failing. Cap it so startup
-# fails fast and retries actually happen on schedule.
-LAVALINK_TIMEOUT = aiohttp.ClientTimeout(total=10)
+    candidates = []
+
+    if raw_host:
+        hosts = [h.strip() for h in raw_host.split(',') if h.strip()]
+        for h in hosts:
+            is_internal = h.endswith('.railway.internal')
+            scheme = 'http' if is_internal else 'https'
+            if raw_ssl:
+                scheme = 'https' if raw_ssl == 'true' else 'http'
+            port = raw_port if raw_port else (None if not is_internal else '8080')
+            url = f"{scheme}://{h}:{port}" if port else f"{scheme}://{h}"
+            candidates.append(url)
+    else:
+        # No host configured at all - try a reasonable public default.
+        candidates.append("https://lavalink-production-ddf1.up.railway.app")
+
+    # de-dupe while preserving order
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+LAVALINK_CANDIDATES = _build_candidates()
+LAVALINK_URL = LAVALINK_CANDIDATES[0]  # active URL, updated once a candidate succeeds
+
+# no timeout previously set on aiohttp requests, so a bad host/port would
+# hang for minutes before failing. Cap it so startup fails fast.
+LAVALINK_TIMEOUT = aiohttp.ClientTimeout(total=8)
 
 logger.info("=" * 50)
-logger.info(f"🎧 Lavalink URL: {LAVALINK_URL}")
+logger.info(f"🎧 Lavalink candidates to try: {LAVALINK_CANDIDATES}")
 logger.info(f"🔑 Password: {LAVALINK_PASSWORD}")
 logger.info("=" * 50)
 
@@ -127,16 +169,16 @@ class MusicQueue:
 
 # ==================== LAVALINK API ====================
 
-async def lavalink_request(endpoint, method='GET', data=None):
+async def lavalink_request(endpoint, method='GET', data=None, base_url=None):
     """Make a request to Lavalink"""
     headers = {
         'Authorization': LAVALINK_PASSWORD,
         'Content-Type': 'application/json',
         'Accept': 'application/json'
     }
-    url = f"{LAVALINK_URL}/{endpoint}"
+    url = f"{base_url or LAVALINK_URL}/{endpoint}"
 
-    # FIX: timeout added so a bad host/port fails in ~10s instead of hanging
+    # timeout added so a bad host/port fails in ~8s instead of hanging
     async with aiohttp.ClientSession(timeout=LAVALINK_TIMEOUT) as session:
         try:
             if method == 'GET':
@@ -179,56 +221,61 @@ async def lavalink_request(endpoint, method='GET', data=None):
             return None
 
 async def lavalink_init():
-    """Create a Lavalink session with retries"""
-    global lavalink_session_id, lavalink_connected, lavalink_retry_count
+    """
+    Try every candidate URL in order. The first one that answers /version
+    becomes the active LAVALINK_URL for the rest of the bot's lifetime.
+    """
+    global lavalink_session_id, lavalink_connected, lavalink_retry_count, LAVALINK_URL
 
-    try:
-        # Check if Lavalink is reachable
-        version = await lavalink_request("version")
-        if version:
-            logger.info(f"✅ Lavalink version: {version}")
-        else:
-            logger.warning("⚠️ Cannot get Lavalink version")
-            return False
+    for candidate in LAVALINK_CANDIDATES:
+        try:
+            logger.info(f"🔍 Trying Lavalink at {candidate} ...")
+            version = await lavalink_request("version", base_url=candidate)
+            if not version:
+                logger.warning(f"⚠️ No response from {candidate}")
+                continue
 
-        # Create session
-        result = await lavalink_request("v4/sessions", 'POST', {
-            "clientName": "DiscordBot",
-            "resumingKey": "discord_bot",
-            "resumingTimeout": 60
-        })
+            logger.info(f"✅ Lavalink version at {candidate}: {version}")
 
-        # FIX: fall back to the unversioned path in case the server is
-        # running an older Lavalink release that doesn't use /v4
-        if not (result and isinstance(result, dict) and 'sessionId' in result):
-            result = await lavalink_request("sessions", 'POST', {
+            # Create session - try v4 path first, fall back to legacy path
+            result = await lavalink_request("v4/sessions", 'POST', {
                 "clientName": "DiscordBot",
                 "resumingKey": "discord_bot",
                 "resumingTimeout": 60
-            })
+            }, base_url=candidate)
 
-        if result and isinstance(result, dict) and 'sessionId' in result:
-            lavalink_session_id = result['sessionId']
-            lavalink_connected = True
-            logger.info(f"✅ Lavalink connected! Session: {lavalink_session_id}")
-            return True
+            if not (result and isinstance(result, dict) and 'sessionId' in result):
+                result = await lavalink_request("sessions", 'POST', {
+                    "clientName": "DiscordBot",
+                    "resumingKey": "discord_bot",
+                    "resumingTimeout": 60
+                }, base_url=candidate)
 
-        logger.error("❌ Failed to create Lavalink session")
-        return False
+            if result and isinstance(result, dict) and 'sessionId' in result:
+                lavalink_session_id = result['sessionId']
+                lavalink_connected = True
+                LAVALINK_URL = candidate  # lock in the working address
+                logger.info(f"✅ Lavalink connected at {candidate}! Session: {lavalink_session_id}")
+                return True
+            else:
+                logger.error(f"❌ {candidate} answered /version but session creation failed")
 
-    except Exception as e:
-        logger.error(f"❌ Lavalink init error: {e}")
-        return False
+        except Exception as e:
+            logger.error(f"❌ Lavalink init error on {candidate}: {e}")
+            continue
+
+    logger.error("❌ None of the Lavalink candidates worked.")
+    return False
 
 async def lavalink_join(guild_id, channel_id):
     if not lavalink_session_id:
         return False
     try:
+        # Note: proper Discord voice join requires a voice WS token/endpoint
+        # from Discord's own gateway (via on_voice_server_update), which this
+        # simplified flow doesn't currently capture. If playback fails after
+        # Lavalink connects successfully, this is the next thing to fix.
         result = await lavalink_request(
-            f"v4/sessions/{lavalink_session_id}/players/{guild_id}",
-            'PATCH',
-            {"voice": {"token": None, "endpoint": None, "sessionId": lavalink_session_id}}
-        ) if False else await lavalink_request(
             f"sessions/{lavalink_session_id}/players/{guild_id}/voice",
             'PATCH',
             {"voice": {"sessionId": lavalink_session_id, "channelId": str(channel_id), "guildId": str(guild_id)}}
@@ -251,10 +298,6 @@ async def lavalink_play(guild_id, track_url):
         if not track_id:
             return False
         return await lavalink_request(
-            f"sessions/{lavalink_session_id}/players/{guild_id}/play",
-            'PATCH',
-            {"track": {"encoded": track_id}}
-        ) if False else await lavalink_request(
             f"sessions/{lavalink_session_id}/players/{guild_id}",
             'PATCH',
             {"track": {"encoded": track_id}}
@@ -571,13 +614,19 @@ async def check_lavalink(ctx):
             description="❌ Not connected!",
             color=discord.Color.red()
         )
-        embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
+        tried = "\n".join(f"• {c}" for c in LAVALINK_CANDIDATES)
+        embed.add_field(name="Candidates Tried", value=tried or "none", inline=False)
         embed.add_field(name="Troubleshooting",
-            value="1. Confirm LAVALINK_HOST is the Lavalink service's public domain\n"
-                  "2. Don't append a port if using Railway's public domain (use LAVALINK_PORT='' + LAVALINK_SSL=true)\n"
-                  "3. If using a TCP Proxy, LAVALINK_PORT must be the proxy port from Railway, not 8080\n"
-                  "4. Check LAVALINK_PASSWORD matches the Lavalink server's application.yml\n"
-                  "5. Check Railway logs for errors on the Lavalink service itself",
+            value="1. Open the Lavalink service's own Railway logs - is it actually running?\n"
+                  "2. Settings -> Networking on the Lavalink service: is 'Public Networking' or "
+                  "'Private Networking' enabled? Use the matching host below.\n"
+                  "3. Same project, private network: set LAVALINK_HOST=<name>.railway.internal "
+                  "(no port needed in env, defaults to 8080)\n"
+                  "4. Public domain: set LAVALINK_HOST=<name>.up.railway.app and leave "
+                  "LAVALINK_PORT empty (Railway edge only serves HTTPS, no custom ports)\n"
+                  "5. Confirm LAVALINK_PASSWORD matches the Lavalink server's application.yml\n"
+                  "6. Tip: set LAVALINK_HOST to a comma-separated list to have the bot "
+                  "auto-try multiple addresses on startup",
             inline=False)
         await ctx.send(embed=embed)
 
