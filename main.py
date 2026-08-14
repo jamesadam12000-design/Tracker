@@ -39,7 +39,7 @@ SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 #
 #  B) PUBLIC DOMAIN (needed if they're in different projects, or you
 #     haven't enabled private networking):
-#       host: lavalink-production-43a7.up.railway.app
+#       host: lavalink-production-ddf1.up.railway.app
 #       port: NONE - Railway's edge only terminates on 443/HTTPS
 #       scheme: https
 #
@@ -47,10 +47,7 @@ SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 # and uses the first one that actually answers /version. Set LAVALINK_HOST
 # to a comma-separated list to have it try more than one automatically.
 
-# Lavalink's Railway service exposes its auth password as
-# LAVALINK_SERVER_PASSWORD (matches the application.yml key
-# lavalink.server.password), not LAVALINK_PASSWORD - read the right one.
-LAVALINK_PASSWORD = os.environ.get('LAVALINK_SERVER_PASSWORD', 'youshallnotpass').strip()
+LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass').strip()
 
 def _build_candidates():
     """
@@ -80,7 +77,7 @@ def _build_candidates():
         # bypasses any public-edge access restrictions), then fall back to
         # the public domain.
         candidates.append("http://lavalink.railway.internal:8080")
-        candidates.append("https://lavalink-production-43a7.up.railway.app")
+        candidates.append("https://lavalink-production-ddf1.up.railway.app")
 
     # de-dupe while preserving order
     seen = set()
@@ -644,7 +641,7 @@ async def check_lavalink(ctx):
                   "(no port needed in env, defaults to 8080)\n"
                   "4. Public domain: set LAVALINK_HOST=<name>.up.railway.app and leave "
                   "LAVALINK_PORT empty (Railway edge only serves HTTPS, no custom ports)\n"
-                  "5. Confirm LAVALINK_SERVER_PASSWORD matches the Lavalink server's application.yml\n"
+                  "5. Confirm LAVALINK_PASSWORD matches the Lavalink server's application.yml\n"
                   "6. Tip: set LAVALINK_HOST to a comma-separated list to have the bot "
                   "auto-try multiple addresses on startup",
             inline=False)
