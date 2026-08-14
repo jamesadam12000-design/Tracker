@@ -174,7 +174,14 @@ async def lavalink_request(endpoint, method='GET', data=None, base_url=None):
     headers = {
         'Authorization': LAVALINK_PASSWORD,
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        # Railway's edge (and many reverse proxies) block requests whose
+        # User-Agent looks like a bare script/library (aiohttp's default
+        # is something like "Python/3.x aiohttp/3.x"), returning 403
+        # before the request even reaches Lavalink. A normal browser-style
+        # UA avoids that filter.
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     url = f"{base_url or LAVALINK_URL}/{endpoint}"
 
@@ -185,6 +192,14 @@ async def lavalink_request(endpoint, method='GET', data=None, base_url=None):
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         return await resp.json()
+                    if resp.status == 403:
+                        logger.error(
+                            f"❌ Lavalink GET {endpoint} -> HTTP 403 (likely blocked by Railway's "
+                            f"edge/WAF before reaching Lavalink itself - not an auth issue; "
+                            f"a bad password gives 401, not 403). If this persists after the "
+                            f"User-Agent fix, private networking is the reliable path."
+                        )
+                        return None
                     logger.error(f"❌ Lavalink GET {endpoint} -> HTTP {resp.status}")
                     return None
             elif method == 'POST':
