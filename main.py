@@ -47,7 +47,7 @@ SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 # and uses the first one that actually answers /version. Set LAVALINK_HOST
 # to a comma-separated list to have it try more than one automatically.
 
-LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
+LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass').strip()
 
 def _build_candidates():
     """
@@ -97,7 +97,8 @@ LAVALINK_TIMEOUT = aiohttp.ClientTimeout(total=8)
 
 logger.info("=" * 50)
 logger.info(f"🎧 Lavalink candidates to try: {LAVALINK_CANDIDATES}")
-logger.info(f"🔑 Password: {LAVALINK_PASSWORD}")
+logger.info(f"🔑 Password (repr, to catch hidden whitespace/quotes): {LAVALINK_PASSWORD!r}")
+logger.info(f"🔑 Password length: {len(LAVALINK_PASSWORD)}")
 logger.info("=" * 50)
 
 # ==================== YT-DLP ====================
@@ -195,15 +196,13 @@ async def lavalink_request(endpoint, method='GET', data=None, base_url=None):
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         return await resp.json()
+                    body_text = await resp.text()
                     if resp.status == 403:
                         logger.error(
-                            f"❌ Lavalink GET {endpoint} -> HTTP 403 (likely blocked by Railway's "
-                            f"edge/WAF before reaching Lavalink itself - not an auth issue; "
-                            f"a bad password gives 401, not 403). If this persists after the "
-                            f"User-Agent fix, private networking is the reliable path."
+                            f"❌ Lavalink GET {endpoint} -> HTTP 403. Response body: {body_text[:500]!r}"
                         )
                         return None
-                    logger.error(f"❌ Lavalink GET {endpoint} -> HTTP {resp.status}")
+                    logger.error(f"❌ Lavalink GET {endpoint} -> HTTP {resp.status}. Body: {body_text[:500]!r}")
                     return None
             elif method == 'POST':
                 async with session.post(url, headers=headers, json=data) as resp:
