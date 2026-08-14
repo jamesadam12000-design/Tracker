@@ -4,9 +4,67 @@ import asyncio
 import aiohttp
 import yt_dlp
 import re
+import sys
+import importlib
 from discord.ext import commands, tasks
 from datetime import datetime
 import logging
+
+# ==================== FIX 4017 ERROR - PATCH VOICE CLIENT ====================
+# This patches discord.py's VoiceClient to handle the 4017 error
+
+def patch_voice_client():
+    """Apply the 4017 fix directly to discord.py's VoiceClient"""
+    try:
+        from discord.voice_client import VoiceClient
+        import discord.gateway
+        
+        # Store original connect method
+        original_connect = VoiceClient.connect
+        
+        async def patched_connect(self, *, timeout=None, reconnect=True):
+            """Patched connect that handles 4017 error"""
+            try:
+                # Clean up any existing connection
+                if hasattr(self, 'ws') and self.ws:
+                    try:
+                        await self.ws.close()
+                    except:
+                        pass
+                    self.ws = None
+                
+                # Try to connect
+                return await original_connect(self, timeout=timeout, reconnect=reconnect)
+                
+            except discord.errors.ConnectionClosed as e:
+                if e.code in (4006, 4017):
+                    logging.warning(f"Voice connection closed with {e.code}, retrying...")
+                    
+                    # Clean up
+                    if hasattr(self, 'ws') and self.ws:
+                        try:
+                            await self.ws.close()
+                        except:
+                            pass
+                        self.ws = None
+                    
+                    # Wait and retry
+                    await asyncio.sleep(2)
+                    return await original_connect(self, timeout=timeout or 30.0, reconnect=reconnect)
+                else:
+                    raise
+        
+        # Apply the patch
+        VoiceClient.connect = patched_connect
+        logging.info("✅ Applied 4017 voice fix")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to patch voice client: {e}")
+        return False
+
+# Apply the patch BEFORE importing discord.py fully
+patch_voice_client()
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
@@ -24,15 +82,6 @@ AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))
 # Spotify API
 SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
-
-# ==================== LAVALINK CONFIGURATION ====================
-# YOUR NEW LAVALINK URL
-LAVALINK_HOST = os.environ.get('LAVALINK_HOST', 'lavalink-production-ddf1.up.railway.app')
-LAVALINK_PORT = int(os.environ.get('LAVALINK_PORT', '8080'))
-LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', 'youshallnotpass')
-LAVALINK_URL = f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
-
-logger.info(f"🎧 Lavalink: {LAVALINK_URL}")
 
 # ==================== YT-DLP OPTIONS ====================
 FFMPEG_OPTIONS = {
@@ -70,7 +119,6 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 voice_activity = {}
 music_queues = {}
 music_loop = {}
-lavalink_connected = False
 
 class MusicQueue:
     def __init__(self):
@@ -106,87 +154,44 @@ class MusicQueue:
     def is_empty(self):
         return len(self.queue) == 0
 
-# ==================== LAVALINK HTTP API ====================
-
-async def lavalink_request(endpoint, method='GET', data=None):
-    """Make a request to Lavalink"""
-    headers = {
-        'Authorization': LAVALINK_PASSWORD,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    }
-    
-    url = f"{LAVALINK_URL}/{endpoint}"
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            if method == 'GET':
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        logger.warning(f"Lavalink GET {endpoint}: {resp.status}")
-                        return None
-            elif method == 'POST':
-                async with session.post(url, headers=headers, json=data) as resp:
-                    return resp.status == 200
-            elif method == 'PATCH':
-                async with session.patch(url, headers=headers, json=data) as resp:
-                    return resp.status == 200
-            elif method == 'DELETE':
-                async with session.delete(url, headers=headers) as resp:
-                    return resp.status == 200
-        except Exception as e:
-            logger.error(f"Lavalink error: {e}")
-            return None
-
-async def lavalink_check():
-    """Check if Lavalink is running"""
-    global lavalink_connected
-    try:
-        result = await lavalink_request("version")
-        if result:
-            lavalink_connected = True
-            logger.info(f"✅ Lavalink connected: {result}")
-            return True
-        return False
-    except:
-        lavalink_connected = False
-        return False
-
-async def lavalink_load_tracks(query):
-    """Load tracks from Lavalink"""
-    try:
-        import urllib.parse
-        encoded = urllib.parse.quote(query)
-        result = await lavalink_request(f"loadtracks?identifier={encoded}")
-        return result
-    except Exception as e:
-        logger.error(f"Lavalink load error: {e}")
-        return None
-
 # ==================== VOICE CONNECTION ====================
 
 async def connect_voice(ctx):
-    """Connect to voice channel"""
+    """Connect to voice channel with the patched voice client"""
     if not ctx.author.voice:
         return None, "❌ You need to be in a voice channel!"
     
     voice_channel = ctx.author.voice.channel
     
+    # Disconnect if already in a different channel
     if ctx.voice_client:
         if ctx.voice_client.channel == voice_channel:
             return ctx.voice_client, None
-        await ctx.voice_client.disconnect()
-        await asyncio.sleep(1)
+        try:
+            await ctx.voice_client.disconnect()
+            await asyncio.sleep(1)
+        except:
+            pass
     
+    # Try to connect with retries
     for attempt in range(3):
         try:
-            voice_client = await voice_channel.connect(timeout=20.0, reconnect=True)
-            await asyncio.sleep(1.5)
+            voice_client = await voice_channel.connect(timeout=30.0, reconnect=True)
+            await asyncio.sleep(2)
             if voice_client and voice_client.is_connected():
                 logger.info(f"✅ Connected to {voice_channel.name}")
                 return voice_client, None
+        except discord.errors.ConnectionClosed as e:
+            if e.code in (4006, 4017):
+                logger.warning(f"Connection error {e.code} on attempt {attempt + 1}, retrying...")
+                if ctx.voice_client:
+                    try:
+                        await ctx.voice_client.disconnect()
+                    except:
+                        pass
+                await asyncio.sleep(3)
+                continue
+            return None, f"❌ Voice error: {str(e)}"
         except Exception as e:
             logger.error(f"Connection attempt {attempt + 1} failed: {e}")
             if attempt < 2:
@@ -194,7 +199,7 @@ async def connect_voice(ctx):
                 continue
             return None, f"❌ Failed to connect: {str(e)}"
     
-    return None, "❌ Could not connect to voice channel"
+    return None, "❌ Could not connect to voice channel after multiple attempts"
 
 # ==================== SEARCH FUNCTIONS ====================
 
@@ -333,20 +338,6 @@ async def play_next(ctx, guild_id):
     queue.is_playing = True
     
     try:
-        # Try Lavalink first
-        if lavalink_connected:
-            try:
-                # Load track from Lavalink
-                load_result = await lavalink_load_tracks(next_track['url'])
-                if load_result and 'tracks' in load_result and load_result['tracks']:
-                    # Lavalink will handle playback
-                    logger.info(f"✅ Playing via Lavalink: {next_track['title']}")
-                    await send_now_playing(ctx, next_track)
-                    return
-            except Exception as e:
-                logger.warning(f"Lavalink playback failed: {e}")
-        
-        # Fallback: Direct YouTube
         audio_url = await get_audio_url(next_track['url'])
         
         if not audio_url:
@@ -366,31 +357,28 @@ async def play_next(ctx, guild_id):
             )
         
         voice_client.play(audio_source, after=after_play)
-        await send_now_playing(ctx, next_track)
+        
+        embed = discord.Embed(
+            title="🎵 Now Playing",
+            description=f"**{next_track['title']}**",
+            color=discord.Color.blue()
+        )
+        if next_track.get('thumbnail'):
+            embed.set_thumbnail(url=next_track['thumbnail'])
+        if next_track.get('duration'):
+            minutes = next_track['duration'] // 60
+            seconds = next_track['duration'] % 60
+            embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
+        if next_track.get('requester'):
+            embed.add_field(name="Requested By", value=next_track['requester'], inline=True)
+        if next_track.get('source') == 'spotify' and next_track.get('spotify_artist'):
+            embed.add_field(name="🎵 Spotify Artist", value=next_track['spotify_artist'], inline=True)
+        await ctx.send(embed=embed)
         
     except Exception as e:
         logger.error(f"Play error: {e}")
         queue.is_playing = False
         await play_next(ctx, guild_id)
-
-async def send_now_playing(ctx, track):
-    """Send now playing embed"""
-    embed = discord.Embed(
-        title="🎵 Now Playing",
-        description=f"**{track['title']}**",
-        color=discord.Color.blue()
-    )
-    if track.get('thumbnail'):
-        embed.set_thumbnail(url=track['thumbnail'])
-    if track.get('duration'):
-        minutes = track['duration'] // 60
-        seconds = track['duration'] % 60
-        embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-    if track.get('requester'):
-        embed.add_field(name="Requested By", value=track['requester'], inline=True)
-    if track.get('source') == 'spotify' and track.get('spotify_artist'):
-        embed.add_field(name="🎵 Spotify Artist", value=track['spotify_artist'], inline=True)
-    await ctx.send(embed=embed)
 
 # ==================== MUSIC COMMANDS ====================
 
@@ -735,15 +723,9 @@ async def sync_members():
 
 @bot.event
 async def on_ready():
-    global lavalink_connected
-    
     logger.info(f"✅ {bot.user} is online!")
     logger.info(f"📊 Bot ID: {bot.user.id}")
     logger.info(f"🎵 Music Bot Ready!")
-    logger.info(f"🎧 Lavalink: {LAVALINK_URL}")
-    
-    # Check Lavalink
-    await lavalink_check()
     
     guild = bot.get_guild(GUILD_ID)
     if guild:
@@ -785,27 +767,6 @@ async def ping(ctx):
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
-@bot.command(name="lavalink")
-async def check_lavalink(ctx):
-    """Check Lavalink connection status"""
-    await lavalink_check()
-    if lavalink_connected:
-        embed = discord.Embed(
-            title="🎧 Lavalink Status",
-            description="✅ Lavalink is connected!",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
-        await ctx.send(embed=embed)
-    else:
-        embed = discord.Embed(
-            title="🎧 Lavalink Status",
-            description="❌ Lavalink is NOT connected - using direct playback",
-            color=discord.Color.orange()
-        )
-        embed.add_field(name="URL", value=LAVALINK_URL, inline=False)
-        await ctx.send(embed=embed)
-
 @bot.command(name="stats")
 async def stats(ctx):
     guild = bot.get_guild(GUILD_ID)
@@ -826,8 +787,8 @@ async def stats(ctx):
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
     embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
     
-    embed.add_field(name="🎧 Audio Mode", value="✅ Lavalink" if lavalink_connected else "🔄 Direct", inline=True)
     embed.add_field(name="🔄 Auto Sync", value="✅ Every 5 minutes", inline=True)
+    embed.add_field(name="📡 Real-time Updates", value="✅ Enabled", inline=True)
     
     embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
@@ -861,7 +822,6 @@ async def help_command(ctx):
         "!remove": "Remove a song from queue by position",
         "!shuffle": "Shuffle the music queue",
         "!leave": "Bot leaves the voice channel",
-        "!lavalink": "Check Lavalink connection status",
         "!ping": "Check bot latency",
         "!stats": "Show bot statistics",
         "!syncnow": "Force manual member sync (Admin only)",
@@ -897,8 +857,7 @@ if __name__ == "__main__":
         print("⚠️ WARNING: GUILD_ID not set!")
     
     print("=" * 50)
-    print("🚀 Starting bot...")
-    print(f"🎧 Lavalink: {LAVALINK_URL}")
+    print("🚀 Starting bot with voice patch...")
     print("📡 Member tracking: Enabled (auto-sync every 5 minutes)")
     print(f"🎙️ AFK management: {'Enabled' if AFK_CHANNEL_ID else 'Disabled'}")
     print("=" * 50)
