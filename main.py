@@ -73,7 +73,10 @@ def _build_candidates():
             url = f"{scheme}://{h}:{port}" if port else f"{scheme}://{h}"
             candidates.append(url)
     else:
-        # No host configured at all - try a reasonable public default.
+        # No host configured at all - try private networking first (faster,
+        # bypasses any public-edge access restrictions), then fall back to
+        # the public domain.
+        candidates.append("http://lavalink.railway.internal:8080")
         candidates.append("https://lavalink-production-ddf1.up.railway.app")
 
     # de-dupe while preserving order
