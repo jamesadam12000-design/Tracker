@@ -897,3 +897,9 @@ if __name__ == "__main__":
         print("⚠️ WARNING: GUILD_ID not set!")
     
     print("=" * 50)
+    print("🚀 Starting bot...")
+    print(f"🎧 Lavalink: {LAVALINK_URL}")
+    print("📡 Member tracking: Enabled (auto-sync every 5 minutes)")
+    print(f"🎙️ AFK management: {'Enabled' if AFK_CHANNEL_ID else 'Disabled'}")
+    print("=" * 50)
+    bot.run(TOKEN, reconnect=True)
