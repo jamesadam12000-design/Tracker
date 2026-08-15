@@ -2,8 +2,7 @@ import discord
 import os
 import asyncio
 import aiohttp
-import yt_dlp
-import re
+import wavelink
 from discord.ext import commands, tasks
 from datetime import datetime
 import logging
@@ -21,39 +20,15 @@ API_SECRET = os.environ.get('API_SECRET', 'Bisaya-Presence-2024-SecretKey!')
 AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '1537088478687531168'))
 AFK_TIMEOUT_MINUTES = int(os.environ.get('AFK_TIMEOUT_MINUTES', '5'))
 
-# Spotify API
+# Lavalink
+LAVALINK_HOST = os.environ.get('LAVALINK_HOST', '')
+LAVALINK_PORT = os.environ.get('LAVALINK_PORT', '443')
+LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', '')
+LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() in ('1', 'true', 'yes')
+
+# Spotify API (used only to resolve metadata; playback still goes through Lavalink)
 SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
-
-# ==================== YT-DLP OPTIONS ====================
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -loglevel quiet',
-    'options': '-vn -loglevel quiet'
-}
-
-YDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'extractaudio': True,
-    'audioformat': 'mp3',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': False,
-    'nocheckcertificate': True,
-    'ignoreerrors': True,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'extract_flat': False,
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'web'],
-            'skip': ['dash', 'hls'],
-        }
-    }
-}
 
 # ==================== BOT SETUP ====================
 intents = discord.Intents.default()
@@ -64,461 +39,342 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# ==================== DATA STORAGE ====================
-voice_activity = {}
-music_queues = {}
-music_loop = {}
 
-class MusicQueue:
-    def __init__(self):
-        self.queue = []
-        self.current = None
-        self.is_playing = False
-        self.loop = False
-    
-    def add(self, track):
-        self.queue.append(track)
-    
-    def next(self):
-        if self.queue:
-            self.current = self.queue.pop(0)
-            return self.current
-        self.current = None
-        self.is_playing = False
-        return None
-    
-    def clear(self):
-        self.queue.clear()
-        self.current = None
-        self.is_playing = False
-    
-    def remove(self, index):
-        if 0 <= index < len(self.queue):
-            return self.queue.pop(index)
-        return None
-    
-    def size(self):
-        return len(self.queue)
-    
-    def is_empty(self):
-        return len(self.queue) == 0
+class Player(wavelink.Player):
+    """wavelink Player subclass so we can remember which text channel to post updates in."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.home: discord.abc.Messageable | None = None
+
+
+# ==================== LAVALINK CONNECTION ====================
+
+async def connect_lavalink():
+    if not LAVALINK_HOST or not LAVALINK_PASSWORD:
+        logger.error("❌ LAVALINK_HOST or LAVALINK_PASSWORD not set — skipping Lavalink connection.")
+        return
+    scheme = "https" if LAVALINK_SSL else "http"
+    uri = f"{scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}"
+    node = wavelink.Node(uri=uri, password=LAVALINK_PASSWORD)
+    try:
+        await wavelink.Pool.connect(nodes=[node], client=bot)
+        logger.info(f"✅ Connecting to Lavalink node at {uri}")
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to Lavalink node: {e}")
+
+
+@bot.event
+async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
+    logger.info(f"✅ Wavelink node ready: {payload.node.uri} (resumed={payload.resumed})")
+
+
+@bot.event
+async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
+    player: Player = payload.player  # type: ignore
+    track = payload.track
+    if not player or not player.home:
+        return
+
+    embed = discord.Embed(
+        title="🎵 Now Playing",
+        description=f"**{track.title}**",
+        color=discord.Color.blue()
+    )
+    if track.artwork:
+        embed.set_thumbnail(url=track.artwork)
+    if track.length:
+        minutes, seconds = divmod(track.length // 1000, 60)
+        embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
+
+    requester = track.extras.get("requester") if track.extras else None
+    if requester:
+        embed.add_field(name="Requested By", value=requester, inline=True)
+
+    spotify_artist = track.extras.get("spotify_artist") if track.extras else None
+    if spotify_artist:
+        embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
+
+    await player.home.send(embed=embed)
+
+
+@bot.event
+async def on_wavelink_inactive_player(player: Player):
+    if player.home:
+        await player.home.send("📭 Queue is empty — leaving the voice channel due to inactivity.")
+    await player.disconnect()
+
 
 # ==================== VOICE CONNECTION ====================
 
-async def connect_voice(ctx):
-    """Connect to voice channel with retry logic"""
+async def connect_voice(ctx) -> tuple[Player | None, str | None]:
+    """Connect to voice channel, returning a wavelink Player."""
     if not ctx.author.voice:
         return None, "❌ You need to be in a voice channel!"
-    
+
     voice_channel = ctx.author.voice.channel
-    
-    if ctx.voice_client:
-        if ctx.voice_client.channel == voice_channel:
-            return ctx.voice_client, None
-        await ctx.voice_client.disconnect()
+
+    player: Player = ctx.voice_client  # type: ignore
+    if player:
+        if player.channel == voice_channel:
+            player.home = ctx.channel
+            return player, None
+        await player.disconnect()
         await asyncio.sleep(1)
-    
-    for attempt in range(3):
-        try:
-            voice_client = await voice_channel.connect(timeout=30.0, reconnect=True)
-            await asyncio.sleep(2)
-            if voice_client and voice_client.is_connected():
-                logger.info(f"✅ Connected to {voice_channel.name}")
-                return voice_client, None
-        except Exception as e:
-            logger.error(f"Connection attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                await asyncio.sleep(2)
-                continue
-            return None, f"❌ Failed to connect: {str(e)}"
-    
-    return None, "❌ Could not connect to voice channel"
 
-# ==================== SEARCH FUNCTIONS ====================
-
-async def search_youtube(query, requester):
-    """Search YouTube for tracks"""
     try:
-        youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            if re.match(youtube_regex, query):
-                info = ydl.extract_info(query, download=False)
-            else:
-                search_query = f"ytsearch3:{query}"
-                info = ydl.extract_info(search_query, download=False)
-            
-            if not info:
-                return []
-            
-            tracks = []
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry:
-                        tracks.append({
-                            'title': entry.get('title', 'Unknown'),
-                            'url': entry.get('webpage_url', entry.get('url')),
-                            'duration': entry.get('duration', 0),
-                            'thumbnail': entry.get('thumbnail', ''),
-                            'uploader': entry.get('uploader', 'Unknown'),
-                            'requester': requester,
-                            'source': 'youtube'
-                        })
-            else:
-                tracks.append({
-                    'title': info.get('title', 'Unknown'),
-                    'url': info.get('webpage_url', info.get('url')),
-                    'duration': info.get('duration', 0),
-                    'thumbnail': info.get('thumbnail', ''),
-                    'uploader': info.get('uploader', 'Unknown'),
-                    'requester': requester,
-                    'source': 'youtube'
-                })
-            
-            return tracks
+        player = await voice_channel.connect(cls=Player, timeout=30.0)
+        player.home = ctx.channel
+        player.autoplay = wavelink.AutoPlayMode.partial
+        logger.info(f"✅ Connected to {voice_channel.name}")
+        return player, None
     except Exception as e:
-        logger.error(f"YouTube search error: {e}")
-        return []
+        logger.error(f"Voice connect failed: {e}")
+        return None, f"❌ Failed to connect: {str(e)}"
 
-async def search_spotify(query, requester):
-    """Search Spotify for tracks"""
-    tracks = []
-    
+
+# ==================== SPOTIFY METADATA RESOLUTION ====================
+
+async def resolve_spotify_query(query):
+    """Resolve a Spotify URL to a 'title artist' search string for Lavalink. Track links only."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        return tracks
-    
+        return None
+
     try:
         import spotipy
         from spotipy.oauth2 import SpotifyClientCredentials
-        
+
         sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
             client_id=SPOTIFY_CLIENT_ID,
             client_secret=SPOTIFY_CLIENT_SECRET
         ))
-        
-        if "open.spotify.com" in query:
-            if "playlist" in query:
-                playlist_id = query.split("playlist/")[1].split("?")[0]
-                results = sp.playlist_tracks(playlist_id)
-                for item in results['items']:
-                    track = item['track']
-                    if track:
-                        search_query = f"{track['name']} {track['artists'][0]['name']}"
-                        yt_tracks = await search_youtube(search_query, requester)
-                        if yt_tracks:
-                            yt_tracks[0]['source'] = 'spotify'
-                            yt_tracks[0]['spotify_artist'] = track['artists'][0]['name']
-                            tracks.append(yt_tracks[0])
-            elif "track" in query:
-                track_id = query.split("track/")[1].split("?")[0]
-                result = sp.track(track_id)
-                search_query = f"{result['name']} {result['artists'][0]['name']}"
-                yt_tracks = await search_youtube(search_query, requester)
-                if yt_tracks:
-                    yt_tracks[0]['source'] = 'spotify'
-                    yt_tracks[0]['spotify_artist'] = result['artists'][0]['name']
-                    tracks.append(yt_tracks[0])
-        else:
-            results = sp.search(q=query, type='track', limit=5)
-            for item in results['tracks']['items']:
-                search_query = f"{item['name']} {item['artists'][0]['name']}"
-                yt_tracks = await search_youtube(search_query, requester)
-                if yt_tracks:
-                    yt_tracks[0]['source'] = 'spotify'
-                    yt_tracks[0]['spotify_artist'] = item['artists'][0]['name']
-                    tracks.append(yt_tracks[0])
-        
-        return tracks
-        
-    except Exception as e:
-        logger.error(f"Spotify search error: {e}")
-        return []
 
-async def get_audio_url(url):
-    """Get direct audio URL from YouTube"""
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info and 'url' in info:
-                return info['url']
-            return None
+        if "track" in query:
+            track_id = query.split("track/")[1].split("?")[0]
+            result = sp.track(track_id)
+            artist = result['artists'][0]['name']
+            return f"{result['name']} {artist}", artist
+
+        # Playlists/albums aren't expanded here — add one track at a time via !play <spotify track url>
+        return None
     except Exception as e:
-        logger.error(f"Error getting audio: {e}")
+        logger.error(f"Spotify resolve error: {e}")
         return None
 
-async def play_next(ctx, guild_id):
-    """Play the next song in queue"""
-    if guild_id not in music_queues:
-        return
-    
-    queue = music_queues[guild_id]
-    voice_client = ctx.guild.voice_client
-    
-    if not voice_client or not voice_client.is_connected():
-        queue.is_playing = False
-        return
-    
-    if queue.loop and queue.current:
-        next_track = queue.current
-    else:
-        next_track = queue.next()
-    
-    if not next_track:
-        queue.is_playing = False
-        await ctx.send("📭 Queue is empty!")
-        return
-    
-    queue.is_playing = True
-    
-    try:
-        audio_url = await get_audio_url(next_track['url'])
-        
-        if not audio_url:
-            await ctx.send(f"❌ Could not play: {next_track['title']}")
-            queue.is_playing = False
-            await play_next(ctx, guild_id)
-            return
-        
-        audio_source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
-        
-        def after_play(error):
-            if error:
-                logger.error(f"Playback error: {error}")
-            asyncio.run_coroutine_threadsafe(
-                play_next(ctx, guild_id),
-                bot.loop
-            )
-        
-        voice_client.play(audio_source, after=after_play)
-        
-        embed = discord.Embed(
-            title="🎵 Now Playing",
-            description=f"**{next_track['title']}**",
-            color=discord.Color.blue()
-        )
-        if next_track.get('thumbnail'):
-            embed.set_thumbnail(url=next_track['thumbnail'])
-        if next_track.get('duration'):
-            minutes = next_track['duration'] // 60
-            seconds = next_track['duration'] % 60
-            embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-        if next_track.get('requester'):
-            embed.add_field(name="Requested By", value=next_track['requester'], inline=True)
-        if next_track.get('source') == 'spotify' and next_track.get('spotify_artist'):
-            embed.add_field(name="🎵 Spotify Artist", value=next_track['spotify_artist'], inline=True)
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Play error: {e}")
-        queue.is_playing = False
-        await play_next(ctx, guild_id)
 
 # ==================== MUSIC COMMANDS ====================
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
-    """Play a song from YouTube or Spotify"""
-    voice_client, error = await connect_voice(ctx)
+    """Play a song from YouTube or Spotify via Lavalink"""
+    player, error = await connect_voice(ctx)
     if error:
         await ctx.send(error)
         return
-    
-    guild_id = ctx.guild.id
-    
-    if guild_id not in music_queues:
-        music_queues[guild_id] = MusicQueue()
-        music_loop[guild_id] = False
-    
-    queue = music_queues[guild_id]
-    
+
     await ctx.send(f"🔍 Searching for: {query}...")
-    
-    tracks = []
-    
-    if "spotify.com" in query or "open.spotify.com" in query:
-        tracks = await search_spotify(query, ctx.author.mention)
-        if not tracks:
-            await ctx.send("❌ No Spotify results found!")
+
+    search_query = query
+    spotify_artist = None
+
+    if "spotify.com" in query:
+        resolved = await resolve_spotify_query(query)
+        if not resolved:
+            await ctx.send("❌ Couldn't resolve that Spotify link (track links only for now)!")
             return
+        search_query, spotify_artist = resolved
+
+    try:
+        result: wavelink.Search = await wavelink.Playable.search(search_query)
+    except Exception as e:
+        logger.error(f"Lavalink search error: {e}")
+        await ctx.send("❌ Search failed — the Lavalink node may not have a working source plugin.")
+        return
+
+    if not result:
+        await ctx.send("❌ No results found! Please try a different song.")
+        return
+
+    if isinstance(result, wavelink.Playlist):
+        for track in result.tracks:
+            track.extras = {"requester": ctx.author.mention, "spotify_artist": spotify_artist}
+        await player.queue.put_wait(result)
+        await ctx.send(f"✅ Added playlist **{result.name}** ({len(result.tracks)} tracks) to queue")
     else:
-        tracks = await search_youtube(query, ctx.author.mention)
-        if not tracks:
-            await ctx.send("❌ No results found! Please try a different song.")
-            return
-    
-    for track in tracks:
-        track['channel_id'] = ctx.channel.id
-        queue.add(track)
-    
-    if len(tracks) == 1:
-        await ctx.send(f"✅ Added to queue: **{tracks[0]['title']}**")
-    else:
-        await ctx.send(f"✅ Added {len(tracks)} tracks to queue")
-    
-    if not queue.is_playing:
-        await play_next(ctx, guild_id)
+        track = result[0]
+        track.extras = {"requester": ctx.author.mention, "spotify_artist": spotify_artist}
+        await player.queue.put_wait(track)
+        await ctx.send(f"✅ Added to queue: **{track.title}**")
+
+    if not player.playing:
+        await player.play(player.queue.get())
+
 
 @bot.command(name="skip")
 async def skip(ctx):
     """Skip the current song"""
-    guild_id = ctx.guild.id
-    if guild_id not in music_queues:
+    player: Player = ctx.voice_client  # type: ignore
+    if not player or not player.playing:
         await ctx.send("❌ Nothing is playing!")
         return
-    queue = music_queues[guild_id]
-    if not queue.is_playing or not ctx.voice_client or not ctx.voice_client.is_playing():
-        await ctx.send("❌ Nothing is playing!")
-        return
-    ctx.voice_client.stop()
+    await player.skip(force=True)
     await ctx.send("⏭️ Skipped the current song!")
+
 
 @bot.command(name="stop")
 async def stop(ctx):
     """Stop playback and clear the queue"""
-    guild_id = ctx.guild.id
-    if guild_id in music_queues:
-        queue = music_queues[guild_id]
-        queue.clear()
-        queue.is_playing = False
-    if ctx.voice_client:
-        ctx.voice_client.stop()
-        await ctx.voice_client.disconnect()
+    player: Player = ctx.voice_client  # type: ignore
+    if not player:
+        await ctx.send("❌ I'm not in a voice channel!")
+        return
+    player.queue.clear()
+    await player.stop()
+    await player.disconnect()
     await ctx.send("⏹️ Stopped playback and cleared queue!")
+
 
 @bot.command(name="pause")
 async def pause(ctx):
     """Pause the current song"""
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
+    player: Player = ctx.voice_client  # type: ignore
+    if player and player.playing and not player.paused:
+        await player.pause(True)
         await ctx.send("⏸️ Paused the current song!")
     else:
         await ctx.send("❌ Nothing is playing!")
 
+
 @bot.command(name="resume")
 async def resume(ctx):
     """Resume the current song"""
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
+    player: Player = ctx.voice_client  # type: ignore
+    if player and player.paused:
+        await player.pause(False)
         await ctx.send("▶️ Resumed playback!")
     else:
         await ctx.send("❌ Nothing is paused!")
 
+
 @bot.command(name="queue", aliases=["q"])
 async def show_queue(ctx):
     """Show the current music queue"""
-    guild_id = ctx.guild.id
-    if guild_id not in music_queues:
+    player: Player = ctx.voice_client  # type: ignore
+    if not player or (not player.current and player.queue.is_empty):
         await ctx.send("📭 Queue is empty!")
         return
-    queue = music_queues[guild_id]
-    if queue.is_empty() and not queue.current:
-        await ctx.send("📭 Queue is empty!")
-        return
+
     embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.blue())
-    if queue.current and queue.is_playing:
-        embed.add_field(name="🎶 Currently Playing", value=f"**{queue.current['title']}**", inline=False)
-    if not queue.is_empty():
+    if player.current:
+        embed.add_field(name="🎶 Currently Playing", value=f"**{player.current.title}**", inline=False)
+
+    if not player.queue.is_empty:
         queue_text = ""
-        for i, track in enumerate(queue.queue[:10], 1):
-            source = "🎵 Spotify" if track.get('source') == 'spotify' else "▶️ YouTube"
-            queue_text += f"`{i}.` {track['title']} ({source})\n"
-        if queue_text:
-            embed.add_field(name=f"⏭️ Up Next ({len(queue.queue)} tracks)", value=queue_text[:1024], inline=False)
-    embed.set_footer(text=f"Queue size: {len(queue.queue)}")
+        for i, track in enumerate(list(player.queue)[:10], 1):
+            queue_text += f"`{i}.` {track.title}\n"
+        embed.add_field(name=f"⏭️ Up Next ({len(player.queue)} tracks)", value=queue_text[:1024], inline=False)
+
+    embed.set_footer(text=f"Queue size: {len(player.queue)}")
     await ctx.send(embed=embed)
+
 
 @bot.command(name="loop")
 async def loop(ctx):
     """Toggle loop for the current song"""
-    guild_id = ctx.guild.id
-    if guild_id not in music_queues:
+    player: Player = ctx.voice_client  # type: ignore
+    if not player:
         await ctx.send("❌ Nothing is playing!")
         return
-    queue = music_queues[guild_id]
-    queue.loop = not queue.loop
-    await ctx.send("🔁 Loop enabled!" if queue.loop else "🔁 Loop disabled!")
+    if player.queue.mode == wavelink.QueueMode.loop:
+        player.queue.mode = wavelink.QueueMode.normal
+        await ctx.send("🔁 Loop disabled!")
+    else:
+        player.queue.mode = wavelink.QueueMode.loop
+        await ctx.send("🔁 Loop enabled!")
+
 
 @bot.command(name="nowplaying", aliases=["np"])
 async def now_playing(ctx):
     """Show the currently playing song"""
-    guild_id = ctx.guild.id
-    if guild_id not in music_queues:
+    player: Player = ctx.voice_client  # type: ignore
+    if not player or not player.current:
         await ctx.send("❌ Nothing is playing!")
         return
-    queue = music_queues[guild_id]
-    if not queue.current or not queue.is_playing:
-        await ctx.send("❌ Nothing is playing!")
-        return
-    track = queue.current
-    embed = discord.Embed(title="🎵 Now Playing", description=f"**{track['title']}**", color=discord.Color.blue())
-    if track.get('thumbnail'):
-        embed.set_thumbnail(url=track['thumbnail'])
-    if track.get('duration'):
-        minutes = track['duration'] // 60
-        seconds = track['duration'] % 60
+
+    track = player.current
+    embed = discord.Embed(title="🎵 Now Playing", description=f"**{track.title}**", color=discord.Color.blue())
+    if track.artwork:
+        embed.set_thumbnail(url=track.artwork)
+    if track.length:
+        minutes, seconds = divmod(track.length // 1000, 60)
         embed.add_field(name="⏱️ Duration", value=f"{minutes}:{seconds:02d}", inline=True)
-    if track.get('uploader'):
-        embed.add_field(name="👤 Uploader", value=track['uploader'], inline=True)
-    if track.get('requester'):
-        embed.add_field(name="📝 Requested By", value=track['requester'], inline=True)
-    if track.get('source') == 'spotify' and track.get('spotify_artist'):
-        embed.add_field(name="🎵 Spotify Artist", value=track['spotify_artist'], inline=True)
-    if queue.loop:
+    if track.author:
+        embed.add_field(name="👤 Uploader", value=track.author, inline=True)
+
+    requester = track.extras.get("requester") if track.extras else None
+    if requester:
+        embed.add_field(name="📝 Requested By", value=requester, inline=True)
+
+    spotify_artist = track.extras.get("spotify_artist") if track.extras else None
+    if spotify_artist:
+        embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
+
+    if player.queue.mode == wavelink.QueueMode.loop:
         embed.add_field(name="🔁 Loop", value="Enabled", inline=True)
+
     await ctx.send(embed=embed)
+
 
 @bot.command(name="clearqueue", aliases=["cq"])
 async def clear_queue(ctx):
     """Clear the music queue"""
-    guild_id = ctx.guild.id
-    if guild_id in music_queues:
-        music_queues[guild_id].clear()
+    player: Player = ctx.voice_client  # type: ignore
+    if player and not player.queue.is_empty:
+        player.queue.clear()
         await ctx.send("🗑️ Queue cleared!")
     else:
         await ctx.send("📭 Queue is already empty!")
 
+
 @bot.command(name="remove")
 async def remove_from_queue(ctx, position: int):
     """Remove a song from the queue by position"""
-    guild_id = ctx.guild.id
-    if guild_id not in music_queues:
+    player: Player = ctx.voice_client  # type: ignore
+    if not player or player.queue.is_empty:
         await ctx.send("📭 Queue is empty!")
         return
-    removed = music_queues[guild_id].remove(position - 1)
-    if removed:
-        await ctx.send(f"✅ Removed: **{removed['title']}**")
-    else:
+    try:
+        removed = player.queue.delete(position - 1)
+        await ctx.send(f"✅ Removed: **{removed.title}**")
+    except Exception:
         await ctx.send(f"❌ No track at position {position}")
+
 
 @bot.command(name="shuffle")
 async def shuffle_queue(ctx):
     """Shuffle the music queue"""
-    import random
-    guild_id = ctx.guild.id
-    if guild_id not in music_queues:
-        await ctx.send("📭 Queue is empty!")
-        return
-    queue = music_queues[guild_id]
-    if len(queue.queue) < 2:
+    player: Player = ctx.voice_client  # type: ignore
+    if not player or len(player.queue) < 2:
         await ctx.send("❌ Need at least 2 songs to shuffle!")
         return
-    random.shuffle(queue.queue)
+    player.queue.shuffle()
     await ctx.send("🔀 Queue shuffled!")
+
 
 @bot.command(name="leave")
 async def leave(ctx):
     """Make the bot leave the voice channel"""
-    guild_id = ctx.guild.id
-    if guild_id in music_queues:
-        music_queues[guild_id].clear()
-        music_queues[guild_id].is_playing = False
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
+    player: Player = ctx.voice_client  # type: ignore
+    if player:
+        player.queue.clear()
+        await player.disconnect()
         await ctx.send("👋 Left the voice channel!")
     else:
         await ctx.send("❌ I'm not in a voice channel!")
 
+
 # ==================== AFK FUNCTIONS ====================
+
+voice_activity = {}
 
 async def move_to_afk(member, afk_channel):
     try:
@@ -529,11 +385,12 @@ async def move_to_afk(member, afk_channel):
     except Exception as e:
         logger.error(f"Error moving {member.name}: {e}")
 
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot or not AFK_CHANNEL_ID:
         return
-    
+
     if after.channel and not before.channel:
         voice_activity[member.id] = {"channel_id": after.channel.id, "last_active": datetime.now()}
     elif not after.channel and before.channel:
@@ -543,9 +400,10 @@ async def on_voice_state_update(member, before, after):
             await move_to_afk(member, after.channel)
             return
         voice_activity[member.id] = {"channel_id": after.channel.id, "last_active": datetime.now()}
-    
+
     if after.channel and after.channel.id != AFK_CHANNEL_ID:
         asyncio.create_task(check_afk(member))
+
 
 async def check_afk(member):
     if not AFK_CHANNEL_ID:
@@ -560,6 +418,7 @@ async def check_afk(member):
             if afk_channel:
                 await move_to_afk(member, afk_channel)
 
+
 # ==================== PRESENCE FUNCTIONS ====================
 
 async def update_member_presence(member):
@@ -571,10 +430,10 @@ async def update_member_presence(member):
             discord.Status.offline: "offline"
         }
         status = status_map.get(member.status, "offline")
-        
+
         activities = []
         custom_status = None
-        
+
         for activity in member.activities:
             if activity.type == discord.ActivityType.custom:
                 custom_status = {
@@ -606,7 +465,7 @@ async def update_member_presence(member):
                     "name": activity.name,
                     "url": getattr(activity, "url", None)
                 })
-        
+
         if activities or custom_status or status != "offline":
             payload = {
                 "discord_id": str(member.id),
@@ -618,7 +477,7 @@ async def update_member_presence(member):
                 "activities": activities,
                 "last_updated": datetime.now().isoformat()
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": API_SECRET, "Content-Type": "application/json"}
                 async with session.post(API_ENDPOINT, json=payload, headers=headers) as resp:
@@ -629,6 +488,7 @@ async def update_member_presence(member):
     except Exception as e:
         logger.error(f"❌ Error updating {member.name}: {e}")
 
+
 # ==================== CONTINUOUS MEMBER SYNC TASK ====================
 
 @tasks.loop(minutes=5)
@@ -638,19 +498,20 @@ async def sync_members():
     if not guild:
         logger.warning("⚠️ Guild not found for sync")
         return
-    
+
     logger.info(f"🔄 Syncing {len(guild.members)} members...")
-    
+
     for member in guild.members:
         if not member.bot:
             try:
                 await update_member_presence(member)
             except Exception as e:
                 logger.error(f"❌ Error syncing {member.name}: {e}")
-        
+
         await asyncio.sleep(0.1)
-    
+
     logger.info("✅ Sync complete!")
+
 
 # ==================== BOT EVENTS ====================
 
@@ -658,33 +519,35 @@ async def sync_members():
 async def on_ready():
     logger.info(f"✅ {bot.user} is online!")
     logger.info(f"📊 Bot ID: {bot.user.id}")
-    logger.info(f"🎵 Music Bot Ready!")
-    
+    logger.info(f"🎵 Music Bot Ready (Lavalink mode)!")
+
+    await connect_lavalink()
+
     guild = bot.get_guild(GUILD_ID)
     if guild:
         logger.info(f"📋 Connected to server: {guild.name}")
         logger.info(f"👥 Members: {len(guild.members)}")
-        
-        # Initial sync
+
         logger.info("🔄 Running initial member sync...")
         for member in guild.members:
             if not member.bot:
                 await update_member_presence(member)
                 await asyncio.sleep(0.1)
-        
+
         logger.info("✅ Initial sync complete!")
-        
-        # Start continuous sync task
+
         sync_members.start()
         logger.info("✅ Continuous member sync started (every 5 minutes)")
     else:
         logger.error(f"❌ Could not find server with ID {GUILD_ID}")
+
 
 @bot.event
 async def on_presence_update(before, after):
     if not after.bot:
         logger.info(f"🔄 Real-time presence update for {after.name}")
         await update_member_presence(after)
+
 
 @bot.event
 async def on_member_update(before, after):
@@ -693,6 +556,7 @@ async def on_member_update(before, after):
             logger.info(f"🔄 Member update for {after.name}")
             await update_member_presence(after)
 
+
 # ==================== BASIC COMMANDS ====================
 
 @bot.command(name="ping")
@@ -700,31 +564,32 @@ async def ping(ctx):
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
+
 @bot.command(name="stats")
 async def stats(ctx):
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         await ctx.send("❌ Not connected to server")
         return
-    
+
     total_members = len([m for m in guild.members if not m.bot])
     online = len([m for m in guild.members if m.status != discord.Status.offline and not m.bot])
     voice_members = len([m for m in guild.members if m.voice and m.voice.channel])
-    
+
     embed = discord.Embed(title="📊 Bot Statistics", color=discord.Color.blue())
     embed.add_field(name="👥 Tracked Members", value=str(total_members), inline=True)
     embed.add_field(name="🟢 Online Now", value=str(online), inline=True)
     embed.add_field(name="🎙️ In Voice", value=str(voice_members), inline=True)
-    
-    total_queued = sum([music_queues[g].size() for g in music_queues if music_queues[g]])
+
+    total_queued = sum(len(p.queue) for p in wavelink.Pool.get_node().players.values()) if wavelink.Pool.nodes else 0
     embed.add_field(name="🎵 Total Queued", value=str(total_queued), inline=True)
-    embed.add_field(name="🎶 Playing", value=sum([1 for g in music_queues if music_queues[g].is_playing]), inline=True)
-    
+
     embed.add_field(name="🔄 Auto Sync", value="✅ Every 5 minutes", inline=True)
     embed.add_field(name="📡 Real-time Updates", value="✅ Enabled", inline=True)
-    
+
     embed.set_footer(text="Made with ❤️")
     await ctx.send(embed=embed)
+
 
 @bot.command(name="syncnow")
 @commands.has_permissions(administrator=True)
@@ -734,6 +599,7 @@ async def sync_now(ctx):
     await sync_members()
     await ctx.send("✅ Manual sync complete!")
 
+
 @bot.command(name="help")
 async def help_command(ctx):
     embed = discord.Embed(
@@ -741,7 +607,7 @@ async def help_command(ctx):
         description="Here are all available commands:",
         color=discord.Color.blue()
     )
-    
+
     commands_list = {
         "!play / !p": "Play a song from YouTube or Spotify",
         "!skip": "Skip the current song",
@@ -760,14 +626,15 @@ async def help_command(ctx):
         "!syncnow": "Force manual member sync (Admin only)",
         "!help": "Show this help message"
     }
-    
+
     text = ""
     for cmd, desc in commands_list.items():
         text += f"**{cmd}** - {desc}\n"
-    
+
     embed.add_field(name="📋 Commands", value=text, inline=False)
     embed.set_footer(text="🎶 Enjoy the music! | Auto-sync every 5 minutes")
     await ctx.send(embed=embed)
+
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -781,6 +648,7 @@ async def on_command_error(ctx, error):
         logger.error(f"Command error: {error}")
         await ctx.send(f"❌ An error occurred: {str(error)}")
 
+
 # ==================== RUN THE BOT ====================
 if __name__ == "__main__":
     if not TOKEN:
@@ -788,9 +656,11 @@ if __name__ == "__main__":
         exit(1)
     if GUILD_ID == 0:
         print("⚠️ WARNING: GUILD_ID not set!")
-    
+    if not LAVALINK_HOST or not LAVALINK_PASSWORD:
+        print("⚠️ WARNING: LAVALINK_HOST / LAVALINK_PASSWORD not set — music commands will fail!")
+
     print("=" * 50)
-    print("🚀 Starting bot (Direct YouTube mode - NO LAVALINK)...")
+    print("🚀 Starting bot (Lavalink mode)...")
     print("📡 Member tracking: Enabled (auto-sync every 5 minutes)")
     print(f"🎙️ AFK management: {'Enabled' if AFK_CHANNEL_ID else 'Disabled'}")
     print("=" * 50)
