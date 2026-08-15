@@ -155,8 +155,11 @@ async def connect_voice(ctx) -> tuple[Player | None, str | None]:
 
 # ==================== SPOTIFY METADATA RESOLUTION ====================
 
-async def resolve_spotify_query(query):
-    """Resolve a Spotify URL to a 'title artist' search string for Lavalink. Track links only."""
+SPOTIFY_PLAYLIST_TRACK_LIMIT = 100  # safety cap so a huge playlist doesn't hang !play
+
+
+async def resolve_spotify_tracks(query):
+    """Resolve a Spotify track/playlist/album URL into a list of (search_query, artist) tuples."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         return None
 
@@ -173,9 +176,37 @@ async def resolve_spotify_query(query):
             track_id = query.split("track/")[1].split("?")[0]
             result = sp.track(track_id)
             artist = result['artists'][0]['name']
-            return f"{result['name']} {artist}", artist
+            return [(f"{result['name']} {artist}", artist)]
 
-        # Playlists/albums aren't expanded here — add one track at a time via !play <spotify track url>
+        if "playlist" in query:
+            playlist_id = query.split("playlist/")[1].split("?")[0]
+            tracks = []
+            results = sp.playlist_items(playlist_id, additional_types=["track"])
+            while results:
+                for item in results.get('items', []):
+                    t = item.get('track')
+                    if t and t.get('name') and t.get('artists'):
+                        artist = t['artists'][0]['name']
+                        tracks.append((f"{t['name']} {artist}", artist))
+                        if len(tracks) >= SPOTIFY_PLAYLIST_TRACK_LIMIT:
+                            return tracks
+                results = sp.next(results) if results.get('next') else None
+            return tracks or None
+
+        if "album" in query:
+            album_id = query.split("album/")[1].split("?")[0]
+            tracks = []
+            results = sp.album_tracks(album_id)
+            while results:
+                for t in results.get('items', []):
+                    if t.get('name') and t.get('artists'):
+                        artist = t['artists'][0]['name']
+                        tracks.append((f"{t['name']} {artist}", artist))
+                        if len(tracks) >= SPOTIFY_PLAYLIST_TRACK_LIMIT:
+                            return tracks
+                results = sp.next(results) if results.get('next') else None
+            return tracks or None
+
         return None
     except Exception as e:
         logger.error(f"Spotify resolve error: {e}")
@@ -194,18 +225,43 @@ async def play(ctx, *, query):
 
     await ctx.send(f"🔍 Searching for: {query}...")
 
-    search_query = query
-    spotify_artist = None
-
     if "spotify.com" in query:
-        resolved = await resolve_spotify_query(query)
+        resolved = await resolve_spotify_tracks(query)
         if not resolved:
-            await ctx.send("❌ Couldn't resolve that Spotify link (track links only for now)!")
+            await ctx.send("❌ Couldn't resolve that Spotify link! (Track, playlist, and album links are supported.)")
             return
-        search_query, spotify_artist = resolved
+
+        added = 0
+        for search_query, artist in resolved:
+            try:
+                result: wavelink.Search = await wavelink.Playable.search(search_query)
+            except Exception as e:
+                logger.error(f"Lavalink search error for '{search_query}': {e}")
+                continue
+
+            if not result:
+                continue
+
+            track = result.tracks[0] if isinstance(result, wavelink.Playlist) else result[0]
+            if not track:
+                continue
+
+            track.extras = {"requester": ctx.author.mention, "spotify_artist": artist}
+            await player.queue.put_wait(track)
+            added += 1
+
+        if added == 0:
+            await ctx.send("❌ Couldn't find playable matches for that Spotify link!")
+            return
+
+        await ctx.send(f"✅ Added {added} track(s) from Spotify to queue")
+
+        if not player.playing:
+            await player.play(player.queue.get())
+        return
 
     try:
-        result: wavelink.Search = await wavelink.Playable.search(search_query)
+        result: wavelink.Search = await wavelink.Playable.search(query)
     except Exception as e:
         logger.error(f"Lavalink search error: {e}")
         await ctx.send("❌ Search failed — the Lavalink node may not have a working source plugin.")
@@ -217,12 +273,12 @@ async def play(ctx, *, query):
 
     if isinstance(result, wavelink.Playlist):
         for track in result.tracks:
-            track.extras = {"requester": ctx.author.mention, "spotify_artist": spotify_artist}
+            track.extras = {"requester": ctx.author.mention}
         await player.queue.put_wait(result)
         await ctx.send(f"✅ Added playlist **{result.name}** ({len(result.tracks)} tracks) to queue")
     else:
         track = result[0]
-        track.extras = {"requester": ctx.author.mention, "spotify_artist": spotify_artist}
+        track.extras = {"requester": ctx.author.mention}
         await player.queue.put_wait(track)
         await ctx.send(f"✅ Added to queue: **{track.title}**")
 
