@@ -49,18 +49,39 @@ class Player(wavelink.Player):
 
 # ==================== LAVALINK CONNECTION ====================
 
-async def connect_lavalink():
+async def connect_lavalink(max_attempts: int = 5, base_delay: float = 3.0):
     if not LAVALINK_HOST or not LAVALINK_PASSWORD:
         logger.error("❌ LAVALINK_HOST or LAVALINK_PASSWORD not set — skipping Lavalink connection.")
         return
     scheme = "https" if LAVALINK_SSL else "http"
     uri = f"{scheme}://{LAVALINK_HOST}:{LAVALINK_PORT}"
-    node = wavelink.Node(uri=uri, password=LAVALINK_PASSWORD)
-    try:
-        await wavelink.Pool.connect(nodes=[node], client=bot)
-        logger.info(f"✅ Connecting to Lavalink node at {uri}")
-    except Exception as e:
-        logger.error(f"❌ Failed to connect to Lavalink node: {e}")
+
+    for attempt in range(1, max_attempts + 1):
+        node = wavelink.Node(uri=uri, password=LAVALINK_PASSWORD)
+        try:
+            await wavelink.Pool.connect(nodes=[node], client=bot)
+            logger.info(f"✅ Connected to Lavalink node at {uri} (attempt {attempt})")
+            return
+        except Exception as e:
+            logger.error(f"❌ Lavalink connect attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                delay = base_delay * attempt
+                logger.info(f"⏳ Retrying Lavalink connection in {delay:.0f}s...")
+                await asyncio.sleep(delay)
+
+    logger.error("❌ Exhausted all Lavalink connection attempts. Music commands will fail until the bot restarts or /reconnectlavalink is run.")
+
+
+@bot.command(name="reconnectlavalink")
+@commands.has_permissions(administrator=True)
+async def reconnect_lavalink(ctx):
+    """Manually retry the Lavalink node connection (Admin only)"""
+    await ctx.send("🔄 Retrying Lavalink connection...")
+    await connect_lavalink()
+    if wavelink.Pool.nodes:
+        await ctx.send("✅ Lavalink connected!")
+    else:
+        await ctx.send("❌ Still couldn't connect — check the Lavalink service is running and the password matches.")
 
 
 @bot.event
@@ -86,11 +107,11 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
         minutes, seconds = divmod(track.length // 1000, 60)
         embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
 
-    requester = track.extras.get("requester") if track.extras else None
+    requester = getattr(track.extras, "requester", None) if track.extras else None
     if requester:
         embed.add_field(name="Requested By", value=requester, inline=True)
 
-    spotify_artist = track.extras.get("spotify_artist") if track.extras else None
+    spotify_artist = getattr(track.extras, "spotify_artist", None) if track.extras else None
     if spotify_artist:
         embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
 
@@ -310,11 +331,11 @@ async def now_playing(ctx):
     if track.author:
         embed.add_field(name="👤 Uploader", value=track.author, inline=True)
 
-    requester = track.extras.get("requester") if track.extras else None
+    requester = getattr(track.extras, "requester", None) if track.extras else None
     if requester:
         embed.add_field(name="📝 Requested By", value=requester, inline=True)
 
-    spotify_artist = track.extras.get("spotify_artist") if track.extras else None
+    spotify_artist = getattr(track.extras, "spotify_artist", None) if track.extras else None
     if spotify_artist:
         embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
 
