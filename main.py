@@ -27,8 +27,8 @@ LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', '')
 LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() in ('1', 'true', 'yes')
 
 # Spotify API (used only to resolve metadata; playback still goes through Lavalink)
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '34c1e0b74f534258aeaa05e324408f77')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '4e87fa64cd9844659e9b5a97a666c724')
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
+SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
 # ==================== BOT SETUP ====================
 intents = discord.Intents.default()
@@ -181,7 +181,11 @@ async def resolve_spotify_tracks(query):
         if "playlist" in query:
             playlist_id = query.split("playlist/")[1].split("?")[0]
             tracks = []
-            results = sp.playlist_items(playlist_id, additional_types=["track"])
+            try:
+                results = sp.playlist_items(playlist_id, additional_types=["track"])
+            except Exception as e:
+                logger.error(f"Spotify playlist access error (likely requires user auth, not just Client Credentials): {e}")
+                return "AUTH_REQUIRED"
             while results:
                 for item in results.get('items', []):
                     t = item.get('track')
@@ -196,7 +200,11 @@ async def resolve_spotify_tracks(query):
         if "album" in query:
             album_id = query.split("album/")[1].split("?")[0]
             tracks = []
-            results = sp.album_tracks(album_id)
+            try:
+                results = sp.album_tracks(album_id)
+            except Exception as e:
+                logger.error(f"Spotify album access error (likely requires user auth, not just Client Credentials): {e}")
+                return "AUTH_REQUIRED"
             while results:
                 for t in results.get('items', []):
                     if t.get('name') and t.get('artists'):
@@ -248,8 +256,18 @@ async def play(ctx, *, query):
 
     if "spotify.com" in query:
         resolved = await resolve_spotify_tracks(query)
+
+        if resolved == "AUTH_REQUIRED":
+            await ctx.send(
+                "❌ Spotify blocked this one — it's likely **private, collaborative, or a Spotify-generated "
+                "playlist** (Blend, Discover Weekly, algorithmic Mix). Those specifically require the owner's "
+                "login and no bot can bypass that restriction. **Genuinely public playlists work fine** — "
+                "try a different link, or paste individual track URLs instead."
+            )
+            return
+
         if not resolved:
-            await ctx.send("❌ Couldn't resolve that Spotify link! (Track, playlist, and album links are supported.)")
+            await ctx.send("❌ Couldn't resolve that Spotify link! (Track links are the most reliable.)")
             return
 
         added = 0
