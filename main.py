@@ -215,16 +215,25 @@ async def resolve_spotify_tracks(query):
 
 # ==================== MUSIC COMMANDS ====================
 
-DEFAULT_SEARCH_SOURCE = os.environ.get('DEFAULT_SEARCH_SOURCE', 'scsearch')  # scsearch=SoundCloud, ytsearch=YouTube
+DEFAULT_SEARCH_SOURCE = os.environ.get('DEFAULT_SEARCH_SOURCE', 'soundcloud')  # 'soundcloud' or 'youtube_music' or 'youtube'
+
+_SOURCE_MAP = {
+    'soundcloud': wavelink.TrackSource.SoundCloud,
+    'youtube_music': wavelink.TrackSource.YouTubeMusic,
+    'youtube': wavelink.TrackSource.YouTube,
+}
+_DEFAULT_SOURCE = _SOURCE_MAP.get(DEFAULT_SEARCH_SOURCE, wavelink.TrackSource.SoundCloud)
 
 
-def build_search_query(text: str) -> str:
-    """Prefix a plain text query with the default search source. Leave URLs untouched."""
+async def search_playable(text: str) -> wavelink.Search:
+    """Search Lavalink for a track/playlist. URLs pass through untouched;
+    plain text is searched against the configured default source (SoundCloud
+    unless overridden), using wavelink's actual source= parameter rather than
+    a manually embedded string prefix — embedding a prefix in the query text
+    gets double-prefixed by wavelink's own default and silently breaks."""
     if text.startswith("http://") or text.startswith("https://"):
-        return text
-    if ":" in text.split(" ")[0]:  # already has an explicit source prefix like ytsearch:
-        return text
-    return f"{DEFAULT_SEARCH_SOURCE}:{text}"
+        return await wavelink.Playable.search(text)
+    return await wavelink.Playable.search(text, source=_DEFAULT_SOURCE)
 
 
 @bot.command(name="play", aliases=["p"])
@@ -246,7 +255,7 @@ async def play(ctx, *, query):
         added = 0
         for search_query, artist in resolved:
             try:
-                result: wavelink.Search = await wavelink.Playable.search(build_search_query(search_query))
+                result: wavelink.Search = await search_playable(search_query)
             except Exception as e:
                 logger.error(f"Lavalink search error for '{search_query}': {e}")
                 continue
@@ -273,7 +282,7 @@ async def play(ctx, *, query):
         return
 
     try:
-        result: wavelink.Search = await wavelink.Playable.search(build_search_query(query))
+        result: wavelink.Search = await search_playable(query)
     except Exception as e:
         logger.error(f"Lavalink search error: {e}")
         await ctx.send("❌ Search failed — the Lavalink node may not have a working source plugin.")
