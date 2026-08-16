@@ -489,9 +489,31 @@ async def on_voice_state_update(member, before, after):
             await move_to_afk(member, after.channel)
             return
         voice_activity[member.id] = {"channel_id": after.channel.id, "last_active": datetime.now()}
+    elif after.channel and before.channel and after.channel.id == before.channel.id:
+        # Same channel, but something changed — self-mute/deafen/video/stream toggles are
+        # user-initiated actions, so treat them as activity and reset the timer.
+        state_changed = (
+            before.self_mute != after.self_mute
+            or before.self_deaf != after.self_deaf
+            or before.self_video != after.self_video
+            or before.self_stream != after.self_stream
+        )
+        if state_changed and member.id in voice_activity:
+            voice_activity[member.id]["last_active"] = datetime.now()
 
     if after.channel and after.channel.id != AFK_CHANNEL_ID:
         asyncio.create_task(check_afk(member))
+
+
+def bot_playing_in_channel(channel_id: int) -> bool:
+    """True if a wavelink Player is actively playing audio in the given voice channel."""
+    if not wavelink.Pool.nodes:
+        return False
+    for node in wavelink.Pool.nodes.values():
+        for player in node.players.values():
+            if player.channel and player.channel.id == channel_id and player.playing and not player.paused:
+                return True
+    return False
 
 
 async def check_afk(member):
@@ -499,6 +521,11 @@ async def check_afk(member):
         return
     await asyncio.sleep(AFK_TIMEOUT_MINUTES * 60)
     if not member.voice or not member.voice.channel or member.voice.channel.id == AFK_CHANNEL_ID:
+        return
+    if bot_playing_in_channel(member.voice.channel.id):
+        # Music is actively playing in this channel — don't AFK anyone listening to it.
+        # Re-check again after another timeout window instead of giving up entirely.
+        asyncio.create_task(check_afk(member))
         return
     if member.id in voice_activity:
         last_active = voice_activity[member.id]["last_active"]
