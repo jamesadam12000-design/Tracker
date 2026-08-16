@@ -215,6 +215,18 @@ async def resolve_spotify_tracks(query):
 
 # ==================== MUSIC COMMANDS ====================
 
+DEFAULT_SEARCH_SOURCE = os.environ.get('DEFAULT_SEARCH_SOURCE', 'scsearch')  # scsearch=SoundCloud, ytsearch=YouTube
+
+
+def build_search_query(text: str) -> str:
+    """Prefix a plain text query with the default search source. Leave URLs untouched."""
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    if ":" in text.split(" ")[0]:  # already has an explicit source prefix like ytsearch:
+        return text
+    return f"{DEFAULT_SEARCH_SOURCE}:{text}"
+
+
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query):
     """Play a song from YouTube or Spotify via Lavalink"""
@@ -234,7 +246,7 @@ async def play(ctx, *, query):
         added = 0
         for search_query, artist in resolved:
             try:
-                result: wavelink.Search = await wavelink.Playable.search(search_query)
+                result: wavelink.Search = await wavelink.Playable.search(build_search_query(search_query))
             except Exception as e:
                 logger.error(f"Lavalink search error for '{search_query}': {e}")
                 continue
@@ -261,7 +273,7 @@ async def play(ctx, *, query):
         return
 
     try:
-        result: wavelink.Search = await wavelink.Playable.search(query)
+        result: wavelink.Search = await wavelink.Playable.search(build_search_query(query))
     except Exception as e:
         logger.error(f"Lavalink search error: {e}")
         await ctx.send("❌ Search failed — the Lavalink node may not have a working source plugin.")
@@ -604,6 +616,22 @@ async def on_ready():
     if guild:
         logger.info(f"📋 Connected to server: {guild.name}")
         logger.info(f"👥 Members: {len(guild.members)}")
+
+        # Back-fill AFK tracking for anyone already in a voice channel — without this,
+        # every redeploy silently drops AFK tracking for already-connected members
+        # until they manually leave and rejoin.
+        if AFK_CHANNEL_ID:
+            backfilled = 0
+            for vc in guild.voice_channels:
+                if vc.id == AFK_CHANNEL_ID:
+                    continue
+                for member in vc.members:
+                    if not member.bot:
+                        voice_activity[member.id] = {"channel_id": vc.id, "last_active": datetime.now()}
+                        asyncio.create_task(check_afk(member))
+                        backfilled += 1
+            if backfilled:
+                logger.info(f"🎙️ Backfilled AFK tracking for {backfilled} already-connected member(s)")
 
         logger.info("🔄 Running initial member sync...")
         for member in guild.members:
