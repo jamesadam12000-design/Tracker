@@ -27,8 +27,8 @@ LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', '')
 LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() in ('1', 'true', 'yes')
 
 # Spotify API (used only to resolve metadata; playback still goes through Lavalink)
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '72077589463049d4b667b725d387b6b8')
+SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', 'a4038660d0c945539efb577491c404c8')
 
 # ==================== BOT SETUP ====================
 intents = discord.Intents.default()
