@@ -158,19 +158,49 @@ async def connect_voice(ctx) -> tuple[Player | None, str | None]:
 SPOTIFY_PLAYLIST_TRACK_LIMIT = 100  # safety cap so a huge playlist doesn't hang !play
 
 
+SPOTIFY_REFRESH_TOKEN = os.environ.get('SPOTIFY_REFRESH_TOKEN', '')
+
+_spotify_client = None
+
+
+def get_spotify_client():
+    """Return a cached Spotify client. Uses a stored user refresh token (access to
+    private/collaborative playlists that user can see) if SPOTIFY_REFRESH_TOKEN is
+    set, otherwise falls back to Client Credentials (public data only)."""
+    global _spotify_client
+    if _spotify_client is not None:
+        return _spotify_client
+
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
+
+    if SPOTIFY_REFRESH_TOKEN:
+        auth_manager = SpotifyOAuth(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            redirect_uri="http://127.0.0.1:8888/callback",  # unused for refresh, but required by spotipy
+            scope="playlist-read-private playlist-read-collaborative",
+        )
+        # Seed the cache with the stored refresh token so spotipy can mint fresh
+        # access tokens without ever needing an interactive browser login here.
+        token_info = auth_manager.refresh_access_token(SPOTIFY_REFRESH_TOKEN)
+        auth_manager.cache_handler.save_token_to_cache(token_info)
+        _spotify_client = spotipy.Spotify(auth_manager=auth_manager)
+    else:
+        _spotify_client = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET
+        ))
+    return _spotify_client
+
+
 async def resolve_spotify_tracks(query):
     """Resolve a Spotify track/playlist/album URL into a list of (search_query, artist) tuples."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         return None
 
     try:
-        import spotipy
-        from spotipy.oauth2 import SpotifyClientCredentials
-
-        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-            client_id=SPOTIFY_CLIENT_ID,
-            client_secret=SPOTIFY_CLIENT_SECRET
-        ))
+        sp = get_spotify_client()
 
         if "track" in query:
             track_id = query.split("track/")[1].split("?")[0]
