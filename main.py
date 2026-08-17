@@ -158,7 +158,7 @@ async def connect_voice(ctx) -> tuple[Player | None, str | None]:
 SPOTIFY_PLAYLIST_TRACK_LIMIT = 100  # safety cap so a huge playlist doesn't hang !play
 
 
-SPOTIFY_REFRESH_TOKEN = os.environ.get('SPOTIFY_REFRESH_TOKEN', '')
+SPOTIFY_REFRESH_TOKEN = os.environ.get('SPOTIFY_REFRESH_TOKEN', 'AQBvIrBvCVfWaPH_q93NqdjRQMQSPwkon3GXZ87ph3C5p3_MTeILi_X3GGSUUBozjovnWPBnKZKrUKV5iLE7-XliQZN3Pji4_kQTWW9YVDLZNY9ajVywOjHhXNL_O9rn-J4')
 
 _spotify_client = None
 
