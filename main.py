@@ -27,8 +27,8 @@ LAVALINK_PASSWORD = os.environ.get('LAVALINK_PASSWORD', '')
 LAVALINK_SSL = os.environ.get('LAVALINK_SSL', 'true').lower() in ('1', 'true', 'yes')
 
 # Spotify API (used only to resolve metadata; playback still goes through Lavalink)
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '34c1e0b74f534258aeaa05e324408f77')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '4e87fa64cd9844659e9b5a97a666c724')
+SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID', '')
+SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET', '')
 
 # ==================== BOT SETUP ====================
 intents = discord.Intents.default()
@@ -158,7 +158,7 @@ async def connect_voice(ctx) -> tuple[Player | None, str | None]:
 SPOTIFY_PLAYLIST_TRACK_LIMIT = 100  # safety cap so a huge playlist doesn't hang !play
 
 
-SPOTIFY_REFRESH_TOKEN = os.environ.get('SPOTIFY_REFRESH_TOKEN', 'AQBvIrBvCVfWaPH_q93NqdjRQMQSPwkon3GXZ87ph3C5p3_MTeILi_X3GGSUUBozjovnWPBnKZKrUKV5iLE7-XliQZN3Pji4_kQTWW9YVDLZNY9ajVywOjHhXNL_O9rn-J4')
+SPOTIFY_REFRESH_TOKEN = os.environ.get('SPOTIFY_REFRESH_TOKEN', '')
 
 _spotify_client = None
 
