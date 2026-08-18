@@ -11,7 +11,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('discord')
 logger.setLevel(logging.INFO)
-
+ 
 # ==================== CONFIGURATION ====================
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 GUILD_ID = int(os.environ.get('GUILD_ID', '1539214622815551528'))
