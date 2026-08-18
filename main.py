@@ -14,7 +14,7 @@ logger.setLevel(logging.INFO)
 
 # ==================== CONFIGURATION ====================
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
-GUILD_ID = int(os.environ.get('GUILD_ID', '1271223880975126689'))
+GUILD_ID = int(os.environ.get('GUILD_ID', '1539214622815551528'))
 API_ENDPOINT = os.environ.get('API_ENDPOINT', 'https://bsyw-profile.vercel.app/api/presence')
 API_SECRET = os.environ.get('API_SECRET', 'Bisaya-Presence-2024-SecretKey!')
 AFK_CHANNEL_ID = int(os.environ.get('AFK_CHANNEL_ID', '1537088478687531168'))
