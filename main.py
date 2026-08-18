@@ -125,11 +125,21 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
     if not player:
         return
 
-    message = payload.exception.get("message") or "unknown error"
-    if player.home:
-        await player.home.send(f"⚠️ Skipping **{payload.track.title}** — playback failed ({message})")
+    message = (payload.exception.get("message") or "unknown error").strip()
+    # Some sources (notably the YouTube plugin) can return a very long message
+    # (full multi-client stack dump) that exceeds Discord's 2000-char message
+    # limit and would otherwise crash this handler entirely.
+    if len(message) > 150:
+        message = message[:150] + "…"
+    title = (payload.track.title or "track")[:80]
 
     logger.error(f"Track exception for '{payload.track.title}': {payload.exception}")
+
+    if player.home:
+        try:
+            await player.home.send(f"⚠️ Skipping **{title}** — playback failed ({message})")
+        except Exception as e:
+            logger.error(f"Failed to send track-exception notice: {e}")
 
     if not player.queue.is_empty:
         await player.skip(force=True)
