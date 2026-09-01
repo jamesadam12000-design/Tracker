@@ -115,6 +115,9 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if spotify_artist:
         embed.add_field(name="🎵 Spotify Artist", value=spotify_artist, inline=True)
 
+    if getattr(track.extras, "is_fallback", False) if track.extras else False:
+        embed.set_footer(text="⚠️ Played via SoundCloud fallback — original source was unavailable")
+
     await player.home.send(embed=embed)
 
 
@@ -123,6 +126,83 @@ async def on_wavelink_inactive_player(player: Player):
     if player.home:
         await player.home.send("📭 Queue is empty — leaving the voice channel due to inactivity.")
     await player.disconnect()
+
+
+# ==================== TRACK LOAD FAILURE FALLBACK ====================
+
+FALLBACK_SOURCE = wavelink.TrackSource.SoundCloud
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
+
+
+def _is_youtube_track(track: wavelink.Playable) -> bool:
+    source = (getattr(track, "source", "") or "").lower()
+    uri = (getattr(track, "uri", "") or "").lower()
+    return source == "youtube" or any(host in uri for host in YOUTUBE_HOSTS)
+
+
+async def _search_fallback(track: wavelink.Playable):
+    """Try to find the same song on SoundCloud when YouTube playback fails."""
+    query_parts = [p for p in (track.title, track.author) if p]
+    query = " ".join(query_parts).strip() or track.title
+
+    try:
+        result: wavelink.Search = await wavelink.Playable.search(query, source=FALLBACK_SOURCE)
+    except Exception as e:
+        logger.error(f"Fallback SoundCloud search failed for '{query}': {e}")
+        return None
+
+    if not result:
+        return None
+
+    return result.tracks[0] if isinstance(result, wavelink.Playlist) else result[0]
+
+
+@bot.event
+async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPayload):
+    """
+    Fired when a track fails to actually load/stream (e.g. YouTube's bot-check
+    or "page needs to be reloaded" errors). If the failed track came from
+    YouTube, transparently retry the same song on SoundCloud instead of just
+    failing silently or stalling the queue.
+    """
+    player: Player = payload.player  # type: ignore
+    track = payload.track
+    if not player:
+        return
+
+    already_fallback = getattr(track.extras, "is_fallback", False) if track.extras else False
+
+    if _is_youtube_track(track) and not already_fallback:
+        logger.warning(f"YouTube playback failed for '{track.title}' — trying SoundCloud fallback.")
+        fallback_track = await _search_fallback(track)
+
+        if fallback_track:
+            old_extras = track.extras.__dict__ if track.extras else {}
+            fallback_track.extras = {**old_extras, "is_fallback": True}
+
+            if player.home:
+                await player.home.send(
+                    f"⚠️ YouTube blocked **{track.title}** — found it on SoundCloud instead."
+                )
+            try:
+                await player.play(fallback_track)
+            except Exception as e:
+                logger.error(f"Failed to start SoundCloud fallback for '{track.title}': {e}")
+            return
+        else:
+            if player.home:
+                await player.home.send(
+                    f"❌ Couldn't play **{track.title}** — YouTube blocked it and no SoundCloud match was found."
+                )
+    else:
+        reason = payload.exception.get("message", "Unknown error") if payload.exception else "Unknown error"
+        if player.home:
+            await player.home.send(f"❌ Playback failed for **{track.title}**: {reason}")
+
+    # Nothing playable came from this track — move on to whatever's next so the
+    # queue doesn't stall waiting for a track that will never start.
+    if not player.playing and not player.queue.is_empty:
+        await player.play(player.queue.get())
 
 
 # ==================== VOICE CONNECTION ====================
@@ -285,7 +365,7 @@ async def play(ctx, *, query):
             if not track:
                 continue
 
-            track.extras = {"requester": ctx.author.mention, "spotify_artist": artist}
+            track.extras = {"requester": ctx.author.mention, "spotify_artist": artist, "is_fallback": False}
             await player.queue.put_wait(track)
             added += 1
 
@@ -312,12 +392,12 @@ async def play(ctx, *, query):
 
     if isinstance(result, wavelink.Playlist):
         for track in result.tracks:
-            track.extras = {"requester": ctx.author.mention}
+            track.extras = {"requester": ctx.author.mention, "is_fallback": False}
         await player.queue.put_wait(result)
         await ctx.send(f"✅ Added playlist **{result.name}** ({len(result.tracks)} tracks) to queue")
     else:
         track = result[0]
-        track.extras = {"requester": ctx.author.mention}
+        track.extras = {"requester": ctx.author.mention, "is_fallback": False}
         await player.queue.put_wait(track)
         await ctx.send(f"✅ Added to queue: **{track.title}**")
 
